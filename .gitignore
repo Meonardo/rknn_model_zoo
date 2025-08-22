@@ -50,3 +50,10 @@ result/
 # for unittest
 unittest/example_test_result
 unittest/env_config.py
+
+examples/SlowFast/
+examples/openvino/python
+examples/openvino/model
+examples/openvino/cpp/deps
+examples/openvino/cpp/build
+examples/openvino/cpp/install
