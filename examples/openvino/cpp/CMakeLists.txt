@@ -38,6 +38,7 @@ set(RGA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/librga")
 set(RKNN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/rknpu2")
 set(MPP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/mpp")
 set(OSAL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/osal")
+set(CV_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/opencv-4.10.0")
 
 set(SOURCE_FILES
 
@@ -76,6 +77,11 @@ target_compile_definitions(
         USE_MPP_BUFFER
 )
 
+find_package(OpenMP)
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OpenMP::OpenMP_CXX)
+endif ()
+
 target_link_libraries(${CMAKE_PROJECT_NAME}
         PRIVATE
 
@@ -87,6 +93,12 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
         ${RKNN_ROOT}/Android/${ANDROID_ABI}/librknnrt.so
         ${MPP_ROOT}/lib/librockchip_mpp.so
         ${OSAL_ROOT}/lib/libosal.a
+        ${CV_ROOT}/libs/libopencv_core.a
+        ${CV_ROOT}/libs/libopencv_imgproc.a
+        ${CV_ROOT}/libs/libopencv_features2d.a
+        ${CV_ROOT}/libs/libopencv_video.a
+        ${CV_ROOT}/libs/libopencv_photo.a
+        ${CV_ROOT}/libs/libopencv_highgui.a
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME}
@@ -99,4 +111,5 @@ target_include_directories(${CMAKE_PROJECT_NAME}
 
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/src/utils
+        ${CV_ROOT}/include
 )

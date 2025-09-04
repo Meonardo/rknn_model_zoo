@@ -11,19 +11,18 @@
 #include <thread>
 #include <vector>
 
+// OpenCV
+#include <opencv2/core.hpp>
+#include <opencv2/highgui.hpp>
+
 #include "Common.h"
 #include "rknn_api.h"
 
 #define MODEL_PATH "/data/local/tmp/lldb-standalone/student_action_recognition.rknn"
-#define TEST_FILE_PATH "/data/local/tmp/lldb-standalone/test_680_400_bgr.bin"
+#define TEST_BIN_FILE_PATH "/data/local/tmp/lldb-standalone/test_680_400_bgr.bin"
+#define TEST_IMG_FILE_PATH "/data/local/tmp/lldb-standalone/test_680_400.jpg"
 
 #define TAG "App"
-
-// Input tensor size: 1x3x400x680, float32, NCHW, BGR
-constexpr int kInputWidth = 680;
-constexpr int kInputHeight = 400;
-constexpr size_t kInputTensorSize = 1 * kInputHeight * kInputWidth * 3;
-constexpr size_t kInputTensorSizeInBytes = kInputTensorSize * sizeof(float);
 
 struct NormalizedBBox {
   float xmin;
@@ -32,44 +31,30 @@ struct NormalizedBBox {
   float ymax;
 };
 
-struct Size {
-  uint32_t width;
-  uint32_t height;
-};
-
-struct SizeF {
-  float width;
-  float height;
-};
-
-struct Rect {
-  int32_t x;
-  int32_t y;
-  uint32_t width;
-  uint32_t height;
-};
-
 struct DetectedAction {
-  /** @brief BBox of detection */
-  Rect rect;
-  /** @brief Action label */
+  cv::Rect rect;
   int label;
-  /** @brief Confidence of detection */
   float detection_conf;
-  /** @brief Confidence of predicted action */
   float action_conf;
 
-  DetectedAction(const Rect& rect, int label, float detection_conf, float action_conf)
+  DetectedAction(const cv::Rect& rect, int label, float detection_conf, float action_conf)
       : rect(rect), label(label), detection_conf(detection_conf), action_conf(action_conf) {}
+  ~DetectedAction() = default;
 };
+
 using DetectedActions = std::vector<DetectedAction>;
 
+// Input tensor size: 1x3x400x680, float32, NCHW, BGR
+constexpr int kInputWidth = 680;
+constexpr int kInputHeight = 400;
+constexpr size_t kInputTensorSize = 1 * kInputHeight * kInputWidth * 3;
+constexpr size_t kInputTensorSizeInBytes = kInputTensorSize * sizeof(float);
 constexpr int NUM_ANCHORS = 4;
-constexpr SizeF ANCHOR_SIZE[NUM_ANCHORS] = {
-    {29.9271, 67.037}, {41.4375, 90.3704}, {58.0833, 129.259}, {91.0208, 190}};
-constexpr Size ANCHOR_BLOB_SIZE = {43, 25};
 constexpr NormalizedBBox VARIANCES = {0.1f, 0.1f, 0.2f, 0.2f};
-constexpr Size FRAME_SIZE = {1920, 1080};
+static cv::Size2f ANCHOR_SIZE[NUM_ANCHORS] = {
+    {29.9271, 67.037}, {41.4375, 90.3704}, {58.0833, 129.259}, {91.0208, 190}};
+static cv::Size FRAME_SIZE = {1920, 1080};
+static cv::Size2f ANCHOR_BLOB_SIZE = {43, 25};
 constexpr int NUM_ACTIONS = 3;
 constexpr float DETECTION_CONF_THRESHOLD = 0.3f;
 constexpr float ACTION_CONF_THRESHOLD = 0.75f;
@@ -77,8 +62,8 @@ constexpr size_t TOP_K = 200;
 constexpr float NMS_SIGMA = 0.6f;
 constexpr int NUM_CANDIDATES = 4300;  // 43*25*4
 
-static NormalizedBBox generate_prior_box(int pos, int step, const SizeF& anchor,
-                                         const Size& blob_size) {
+static NormalizedBBox generate_prior_box(int pos, int step, const cv::Size2f& anchor,
+                                         const cv::Size& blob_size) {
   const int row = pos / blob_size.width;
   const int col = pos % blob_size.width;
 
@@ -103,8 +88,8 @@ static NormalizedBBox parse_bbox_record(const float* data) {
   return bbox;
 }
 
-static Rect convert_to_rect(const NormalizedBBox& prior_bbox, const NormalizedBBox& variances,
-                            const NormalizedBBox& encoded_bbox, const Size& frame_size) {
+static cv::Rect convert_to_rect(const NormalizedBBox& prior_bbox, const NormalizedBBox& variances,
+                                const NormalizedBBox& encoded_bbox, const cv::Size& frame_size) {
   // Convert prior bbox to CV_Rect
   const float prior_width = prior_bbox.xmax - prior_bbox.xmin;
   const float prior_height = prior_bbox.ymax - prior_bbox.ymin;
@@ -129,30 +114,17 @@ static Rect convert_to_rect(const NormalizedBBox& prior_bbox, const NormalizedBB
   const float decoded_bbox_ymax = decoded_bbox_center_y + 0.5f * decoded_bbox_height;
 
   // Convert decoded bbox to CV_Rect
-  return Rect{static_cast<int32_t>(decoded_bbox_xmin * frame_size.width),
-              static_cast<int32_t>(decoded_bbox_ymin * frame_size.height),
-              static_cast<uint32_t>((decoded_bbox_xmax - decoded_bbox_xmin) * frame_size.width),
-              static_cast<uint32_t>((decoded_bbox_ymax - decoded_bbox_ymin) * frame_size.height)};
-}
-
-static Rect intersection(const Rect& r1, const Rect& r2) {
-  Rect inter{0, 0, 0, 0};
-
-  inter.x = std::max(r1.x, r2.x);
-  inter.y = std::max(r1.y, r2.y);
-  inter.width = std::min(r1.x + r1.width, r2.x + r2.width) - inter.x;
-  inter.height = std::min(r1.y + r1.height, r2.y + r2.height) - inter.y;
-
-  // Clamp to zero if no overlap
-  if (inter.width < 0) inter.width = 0;
-  if (inter.height < 0) inter.height = 0;
-
-  return inter;
+  return cv::Rect{
+      static_cast<int32_t>(decoded_bbox_xmin * frame_size.width),
+      static_cast<int32_t>(decoded_bbox_ymin * frame_size.height),
+      static_cast<int32_t>((decoded_bbox_xmax - decoded_bbox_xmin) * frame_size.width),
+      static_cast<int32_t>((decoded_bbox_ymax - decoded_bbox_ymin) * frame_size.height)};
 }
 
 static void soft_non_max_suppression(const DetectedActions& detections, const float sigma,
                                      size_t top_k, const float min_det_conf,
                                      std::vector<int>* out_indices) {
+  // Store input bbox scores
   std::vector<float> scores(detections.size());
   for (size_t i = 0; i < detections.size(); ++i) {
     scores[i] = detections[i].detection_conf;
@@ -160,48 +132,54 @@ static void soft_non_max_suppression(const DetectedActions& detections, const fl
 
   top_k = std::min(top_k, scores.size());
 
+  // Select top-k score indices
   std::vector<size_t> score_idx(scores.size());
   std::iota(score_idx.begin(), score_idx.end(), 0);
-  if (top_k < scores.size()) {
-    std::nth_element(score_idx.begin(), score_idx.begin() + top_k, score_idx.end(),
-                     [&scores](size_t i1, size_t i2) { return scores[i1] > scores[i2]; });
-    score_idx.resize(top_k);
-  }
+  std::nth_element(score_idx.begin(), score_idx.begin() + top_k, score_idx.end(),
+                   [&scores](size_t i1, size_t i2) { return scores[i1] > scores[i2]; });
 
+  // Extract top-k score values
   std::vector<float> top_scores(top_k);
-  for (size_t i = 0; i < top_k; ++i) {
+  for (size_t i = 0; i < top_scores.size(); ++i) {
     top_scores[i] = scores[score_idx[i]];
   }
 
+  // Carry out Soft Non-Maximum Suppression algorithm
   out_indices->clear();
-  for (size_t iter = 0; iter < top_scores.size(); ++iter) {
+  for (size_t step = 0; step < top_scores.size(); ++step) {
     auto best_score_itr = std::max_element(top_scores.begin(), top_scores.end());
-    size_t best_idx = std::distance(top_scores.begin(), best_score_itr);
-    if (top_scores[best_idx] < min_det_conf) {
+    if (*best_score_itr < min_det_conf) {
       break;
     }
-    int anchor_idx = score_idx[best_idx];
+
+    // Add current bbox to output list
+    const size_t local_anchor_idx = std::distance(top_scores.begin(), best_score_itr);
+    const int anchor_idx = score_idx[local_anchor_idx];
     out_indices->emplace_back(anchor_idx);
+    *best_score_itr = 0.f;
 
-    // Set score to zero, do NOT erase
-    top_scores[best_idx] = 0.0f;
-
-    const auto& rect1 = detections[anchor_idx].rect;
-    for (size_t i = 0; i < top_scores.size(); ++i) {
-      if (top_scores[i] < min_det_conf) {
+    // Update top_scores of the rest bboxes
+    for (size_t local_reference_idx = 0; local_reference_idx < top_scores.size();
+         ++local_reference_idx) {
+      // Skip updating step for the low-confidence bbox
+      if (top_scores[local_reference_idx] < min_det_conf) {
         continue;
       }
-      const auto& rect2 = detections[score_idx[i]].rect;
-      const auto inter = intersection(rect1, rect2);
+
+      // Calculate the Intersection over Union metric between two bboxes
+      const size_t reference_idx = score_idx[local_reference_idx];
+      const auto& rect1 = detections[anchor_idx].rect;
+      const auto& rect2 = detections[reference_idx].rect;
+      const auto intersection = rect1 & rect2;
       float overlap = 0.f;
-      if (inter.width > 0 && inter.height > 0) {
-        int intersection_area = inter.width * inter.height;
-        int rect1_area = rect1.width * rect1.height;
-        int rect2_area = rect2.width * rect2.height;
+      if (intersection.width > 0 && intersection.height > 0) {
+        const int intersection_area = intersection.area();
         overlap = static_cast<float>(intersection_area) /
-                  static_cast<float>(rect1_area + rect2_area - intersection_area);
+                  static_cast<float>(rect1.area() + rect2.area() - intersection_area);
       }
-      top_scores[i] *= std::exp(-overlap * overlap / sigma);
+
+      // Scale bbox score using the exponential rule
+      top_scores[local_reference_idx] *= std::exp(-overlap * overlap / sigma);
     }
   }
 }
@@ -240,63 +218,94 @@ static unsigned char* load_model(const char* filename, uint32_t* model_size) {
   return model;
 }
 
-static void bgr24_to_nchw_u8(const uint8_t* src, int W, int H, uint8_t* dst) {
+static void bgr24_to_nchw_float(const uint8_t* src, int W, int H, float* dst, float scale) {
   const size_t plane = static_cast<size_t>(W) * H;
-  uint8_t* dB = dst + 0 * plane;
-  uint8_t* dG = dst + 1 * plane;
-  uint8_t* dR = dst + 2 * plane;
+  float* dB = dst + 0 * plane;
+  float* dG = dst + 1 * plane;
+  float* dR = dst + 2 * plane;
 
   for (int y = 0; y < H; ++y) {
     const uint8_t* row = src + static_cast<size_t>(y) * W * 3;
     for (int x = 0; x < W; ++x) {
-      const uint8_t B = row[3 * x + 0];
-      const uint8_t G = row[3 * x + 1];
-      const uint8_t R = row[3 * x + 2];
       const size_t idx = static_cast<size_t>(y) * W + x;
-      dB[idx] = B;
-      dG[idx] = G;
-      dR[idx] = R;
+      dB[idx] = row[3 * x + 0] * scale;  // B
+      dG[idx] = row[3 * x + 1] * scale;  // G
+      dR[idx] = row[3 * x + 2] * scale;  // R
     }
   }
 }
 
-void bgr24_to_nchw_float(
-    const uint8_t* bgr, int W, int H,
-    float* out,  // size = 3*W*H
-    bool channels_are_bgr = true, float scale = 1.0f / 255.0f,
-    float mean[3] = nullptr,  // e.g. {0.0f,0.0f,0.0f} or {0.485f,0.456f,0.406f}
-    float stdv[3] = nullptr)  // e.g. {1.0f,1.0f,1.0f} or {0.229f,0.224f,0.225f}
-{
-  const size_t plane = (size_t) W * H;
-  float* d0 = out + 0 * plane;
-  float* d1 = out + 1 * plane;
-  float* d2 = out + 2 * plane;
+static void bgr24_to_nhwc_float(const uint8_t* src, int W, int H, float* dst, float scale) {
+  for (int y = 0; y < H; ++y) {
+    const uint8_t* row = src + static_cast<size_t>(y) * W * 3;
+    for (int x = 0; x < W; ++x) {
+      const size_t idx = (static_cast<size_t>(y) * W + x) * 3;
+      dst[idx + 0] = row[3 * x + 0] * scale;  // B
+      dst[idx + 1] = row[3 * x + 1] * scale;  // G
+      dst[idx + 2] = row[3 * x + 2] * scale;  // R
+    }
+  }
+}
 
-  const float m[3] = {mean ? mean[0] : 0.f, mean ? mean[1] : 0.f, mean ? mean[2] : 0.f};
-  const float s[3] = {stdv ? stdv[0] : 1.f, stdv ? stdv[1] : 1.f, stdv ? stdv[2] : 1.f};
+static bool read_file(const std::string& path, std::vector<uint8_t>& buf) {
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if (!f) {
+    LOGE(TAG, "open file %s failed", path.c_str());
+    return false;
+  }
+  std::streamsize sz = f.tellg();
+  if (sz <= 0) {
+    LOGE(TAG, "file %s is empty", path.c_str());
+    return false;
+  }
+  buf.resize(static_cast<size_t>(sz));
+  f.seekg(0, std::ios::beg);
+  return (bool) f.read(reinterpret_cast<char*>(buf.data()), sz);
+}
+
+static void bgr_to_nchw_float_no_norm(const cv::Mat& img, std::vector<float>& out) {
+  CV_Assert(img.type() == CV_8UC3 && img.cols == kInputWidth && img.rows == kInputHeight);
+  const int W = kInputWidth, H = kInputHeight;
+  const size_t plane = (size_t) W * H;
+  out.resize(3 * plane);  // 1CHW
+
+  float* dB = out.data() + 0 * plane;
+  float* dG = out.data() + 1 * plane;
+  float* dR = out.data() + 2 * plane;
 
   for (int y = 0; y < H; ++y) {
-    const uint8_t* row = bgr + (size_t) y * W * 3;
+    const uint8_t* row = img.ptr<uint8_t>(y);
     for (int x = 0; x < W; ++x) {
-      uint8_t B = row[3 * x + 0];
-      uint8_t G = row[3 * x + 1];
-      uint8_t R = row[3 * x + 2];
       const size_t idx = (size_t) y * W + x;
-
-      // If model expects BGR order in NCHW (common with OpenCV-trained models)
-      if (channels_are_bgr) {
-        d0[idx] = (B * scale - m[0]) / s[0];
-        d1[idx] = (G * scale - m[1]) / s[1];
-        d2[idx] = (R * scale - m[2]) / s[2];
-      } else {  // model expects RGB order
-        d0[idx] = (R * scale - m[0]) / s[0];
-        d1[idx] = (G * scale - m[1]) / s[1];
-        d2[idx] = (B * scale - m[2]) / s[2];
-      }
+      dB[idx] = (float) row[3 * x + 0];  // 0..255
+      dG[idx] = (float) row[3 * x + 1];
+      dR[idx] = (float) row[3 * x + 2];
     }
   }
 }
 
+void bgr_to_nhwc_float_no_norm(const cv::Mat& img, std::vector<float>& out) {
+  CV_Assert(img.type() == CV_8UC3 && img.cols == kInputWidth && img.rows == kInputHeight);
+  const int W = kInputWidth, H = kInputHeight;
+  out.resize(1 * H * W * 3);  // NHWC
+
+  float* dst = out.data();
+
+  for (int y = 0; y < H; ++y) {
+    const uint8_t* row = img.ptr<uint8_t>(y);
+    for (int x = 0; x < W; ++x) {
+      // NHWC index: (y, x, c)
+      size_t idx = ((size_t) y * W + x) * 3;
+      dst[idx + 0] = static_cast<float>(row[3 * x + 0]);  // B
+      dst[idx + 1] = static_cast<float>(row[3 * x + 1]);  // G
+      dst[idx + 2] = static_cast<float>(row[3 * x + 2]);  // R
+    }
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// App class
+////////////////////////////////////////////////////////////////////////////////
 struct App {
   std::atomic<bool> running;
 
@@ -307,6 +316,9 @@ struct App {
   std::vector<rknn_tensor_mem*> input_mems;
   std::vector<rknn_tensor_mem*> output_mems;
 
+  std::vector<float> input_data;
+  bool input_data_ready = false;
+
   App(const char* model_path);
   ~App();
 
@@ -314,11 +326,16 @@ struct App {
   void DeInit();
   int Inference();
   void PostProcess(const std::vector<rknn_output>& outputs);
+
+  // Load input data from binary file
+  int LoadTestData(const std::string& bin_path, std::vector<float>& input_data);
+  // Load input data from image file(backend is OpenCV)
+  int LoadTestImage(const std::string& img_path, std::vector<float>& input_data);
 };
 
 std::unique_ptr<App> app_instance;
 
-App::App(const char* model_path) : running(false) {
+App::App(const char* model_path) : running(false), input_data(kInputTensorSize) {
   auto ret = Init(model_path);
   if (ret == 0) {
     LOGI(TAG, "App initialized successfully");
@@ -427,6 +444,12 @@ int App::Init(const char* model_path) {
   //     return ret;
   //   }
   // }
+  // Load input data from binary file
+  if (LoadTestData(TEST_BIN_FILE_PATH, input_data) != 0) {
+    LOGE(TAG, "Failed to load input data from binary file");
+    return -1;
+  }
+  input_data_ready = true;
 
   return 0;
 }
@@ -450,44 +473,47 @@ void App::DeInit() {
   LOGI(TAG, "App deinitialized successfully");
 }
 
-int App::Inference() {
+// Load input data from binary file
+int App::LoadTestData(const std::string& bin_path, std::vector<float>& input_data) {
   // Read entire input
-  std::ifstream fin(TEST_FILE_PATH, std::ios::binary | std::ios::ate);
-  if (!fin) {
-    LOGE(TAG, "Failed to open input: %s", TEST_FILE_PATH);
+  std::vector<uint8_t> bgr(kInputTensorSize);
+  if (!read_file(bin_path, bgr)) {
+    LOGE(TAG, "Failed to read input file: %s", bin_path.c_str());
     return -1;
   }
-  const std::streamsize fsz = fin.tellg();
-  fin.seekg(0, std::ios::beg);
+  // Convert BGR24 to NHWC float32
+  bgr24_to_nhwc_float(bgr.data(), kInputWidth, kInputHeight, input_data.data(), 1.0f);
 
-  if (fsz != static_cast<std::streamsize>(kInputTensorSize)) {
-    LOGE(TAG, "Input file size %ld does not match expected size %zu", fsz, kInputTensorSize);
-    return -2;
+  return 0;
+}
+
+// Load input data from image file(backend is OpenCV)
+int App::LoadTestImage(const std::string& img_path, std::vector<float>& input_data) {
+  cv::Mat img = cv::imread(img_path);
+  if (img.empty()) {
+    LOGE(TAG, "Failed to read image: %s", img_path.c_str());
+    return -1;
   }
 
-  std::vector<uint8_t> bgr(kInputTensorSize);
-  if (!fin.read(reinterpret_cast<char*>(bgr.data()), fsz)) {
-    LOGE(TAG, "Failed to read input data");
-    return -3;
+  // Convert to NHWC float32
+  bgr_to_nhwc_float_no_norm(img, input_data);
+
+  return 0;
+}
+
+int App::Inference() {
+  if (!input_data_ready) {
+    LOGE(TAG, "Input data is not ready");
+    return -1;
   }
-  fin.close();
-
-  // Convert to NCHW uint8
-  const size_t plane = static_cast<size_t>(kInputWidth) * kInputHeight;
-  std::vector<uint8_t> nchw_u8(3 * plane);
-  bgr24_to_nchw_u8(bgr.data(), kInputWidth, kInputHeight, nchw_u8.data());
-
-  // Convert to float32 and normalize
-  std::vector<float> nchw_f32(kInputTensorSize);
-  bgr24_to_nchw_float(nchw_u8.data(), kInputWidth, kInputHeight, nchw_f32.data());
-
+  
   // Prepare input
   std::vector<rknn_input> inputs(io_num.n_input);
   inputs[0].index = 0;
   inputs[0].type = RKNN_TENSOR_FLOAT32;
-  inputs[0].fmt = RKNN_TENSOR_NCHW;
+  inputs[0].fmt = RKNN_TENSOR_NHWC;
   inputs[0].size = kInputTensorSizeInBytes;
-  inputs[0].buf = nchw_f32.data();
+  inputs[0].buf = input_data.data();
 
   auto ret = rknn_inputs_set(rknn_ctx, io_num.n_input, inputs.data());
   if (ret != RKNN_SUCC) {
@@ -619,8 +645,8 @@ int main(int argc, char* argv[]) {
     LOGE(TAG, "Model file not found: %s", MODEL_PATH);
     return -1;
   }
-  if (!std::filesystem::exists(TEST_FILE_PATH)) {
-    LOGE(TAG, "Test file not found: %s", TEST_FILE_PATH);
+  if (!std::filesystem::exists(TEST_BIN_FILE_PATH)) {
+    LOGE(TAG, "Test file not found: %s", TEST_BIN_FILE_PATH);
     return -1;
   }
 
