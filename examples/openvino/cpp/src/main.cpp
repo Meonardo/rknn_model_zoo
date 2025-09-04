@@ -30,6 +30,7 @@
 #define TAG "App"
 
 #define TEST_WITH_IMAGE 0
+#define USE_ZEROS_COPY 1
 
 struct NormalizedBBox {
   float xmin;
@@ -256,6 +257,7 @@ static void bgr24_to_nhwc_float(const uint8_t* src, int W, int H, float* dst, fl
 }
 
 // Convert BGR24 to NHWC float32 with stride support
+
 static void bgr24_to_nhwc_float_stride(const uint8_t* src, int W, int H, int stride, float* dst,
                                        float scale) {
   // stride: number of bytes per row (may be larger than W*3)
@@ -264,10 +266,29 @@ static void bgr24_to_nhwc_float_stride(const uint8_t* src, int W, int H, int str
     const uint8_t* row = src + static_cast<size_t>(y) * stride * 3;
     for (int x = 0; x < W; ++x) {
       const size_t idx = ((size_t) y * W + x) * 3;
-      // Use row[3*x + c] for BGR, but only up to W*3 bytes per row
       dst[idx + 0] = static_cast<float>(row[3 * x + 0]) * scale;  // B
       dst[idx + 1] = static_cast<float>(row[3 * x + 1]) * scale;  // G
       dst[idx + 2] = static_cast<float>(row[3 * x + 2]) * scale;  // R
+    }
+  }
+}
+
+// Convert BGR24 to NCHW float32 with stride support
+static void bgr24_to_nchw_float_stride(const uint8_t* src, int W, int H, int stride, float* dst,
+                                       float scale) {
+  // stride: number of bytes per row (may be larger than W*3)
+  // NCHW layout: dst[c * H * W + y * W + x]
+  size_t plane = (size_t) W * H;
+  float* dB = dst + 0 * plane;
+  float* dG = dst + 1 * plane;
+  float* dR = dst + 2 * plane;
+  for (int y = 0; y < H; ++y) {
+    const uint8_t* row = src + (size_t) y * stride * 3;
+    for (int x = 0; x < W; ++x) {
+      size_t idx = (size_t) y * W + x;
+      dB[idx] = static_cast<float>(row[3 * x + 0]) * scale;
+      dG[idx] = static_cast<float>(row[3 * x + 1]) * scale;
+      dR[idx] = static_cast<float>(row[3 * x + 2]) * scale;
     }
   }
 }
@@ -353,7 +374,7 @@ struct App {
   int Init(const char* model_path);
   void DeInit();
   int Inference(const rga_buffer_t* buffer);
-  void PostProcess(const std::vector<rknn_output>& outputs);
+  void PostProcess(const float* bboxes, const float* scores, const float* const* anchors);
   void OnDecodedFrame(const VideoFrameSlot& frame);
 
   bool Start();
@@ -635,48 +656,65 @@ int App::Init(const char* model_path) {
     dump_tensor_attr(&output_attrs[i]);
   }
 
-  // // Create input tensors
-  // input_mems.reserve(io_num.n_input);
-  // for (int i = 0; i < io_num.n_input; i++) {
-  //   input_attrs[i].fmt = RKNN_TENSOR_NCHW;  // Set format to NCHW
-  //   input_attrs[i].type = RKNN_TENSOR_FLOAT32; // float32, not quantized
+#if USE_ZEROS_COPY
+  // Create input tensors
+  input_mems.reserve(io_num.n_input);
+  for (int i = 0; i < io_num.n_input; i++) {
+    input_attrs[i].fmt = RKNN_TENSOR_NHWC;      // Set format to NHWC
+    input_attrs[i].type = RKNN_TENSOR_FLOAT32;  // float32, not quantized
+    input_attrs[i].size = kInputTensorSizeInBytes;
+    input_attrs[i].size_with_stride = kInputTensorSizeInBytes;
 
-  //   // Create memory for this tensor
-  //   auto* mem = rknn_create_mem(rknn_ctx, kInputTensorSizeInBytes);
-  //   if (!mem) {
-  //     LOGE(TAG, "create input mem fail");
-  //     return -1;
-  //   }
-  //   input_mems.push_back(mem);
+    // Create memory for this tensor
+    auto* mem = rknn_create_mem(rknn_ctx, kInputTensorSizeInBytes);
+    if (!mem) {
+      LOGE(TAG, "create input mem fail");
+      return -1;
+    }
+    input_mems.push_back(mem);
 
-  //   // Set input tensor memory with attributes
-  //   ret = rknn_set_io_mem(rknn_ctx, mem, &input_attrs[i]);
-  //   if (ret != RKNN_SUCC) {
-  //     LOGE(TAG, "rknn_set_io_mem fail ret=%d", ret);
-  //     return ret;
-  //   }
-  // }
+    // Set input tensor memory with attributes
+    ret = rknn_set_io_mem(rknn_ctx, mem, &input_attrs[i]);
+    if (ret != RKNN_SUCC) {
+      LOGE(TAG, "rknn_set_io_mem fail ret=%d", ret);
+      return ret;
+    }
+  }
 
-  // // Create output tensors
-  // output_mems.reserve(io_num.n_output);
-  // for (int i = 0; i < io_num.n_output; i++) {
-  //   output_attrs[i].type = RKNN_TENSOR_FLOAT32; // float32, not quantized
+  // Create output tensors
+  output_mems.reserve(io_num.n_output);
+  for (int i = 0; i < io_num.n_output; i++) {
+    output_attrs[i].type = RKNN_TENSOR_FLOAT32;  // float32, not quantized
 
-  //   // Create memory for this tensor
-  //   auto* mem = rknn_create_mem(rknn_ctx, output_attrs[i].size);
-  //   if (!mem) {
-  //     LOGE(TAG, "create output mem fail");
-  //     return -1;
-  //   }
-  //   output_mems.push_back(mem);
+    // Calculate output tensor size
+    if (strcmp(output_attrs[i].name, "bboxes") == 0) {
+      output_attrs[i].size = output_attrs[i].dims[1] * sizeof(float);
+      output_attrs[i].size_with_stride = output_attrs[i].size;
+    } else if (strcmp(output_attrs[i].name, "bboxes_scores") == 0) {
+      output_attrs[i].size = output_attrs[i].dims[1] * sizeof(float);
+      output_attrs[i].size_with_stride = output_attrs[i].size;
+    } else {
+      output_attrs[i].size = output_attrs[i].dims[1] * output_attrs[i].dims[2] *
+                             output_attrs[i].dims[3] * sizeof(float);
+      output_attrs[i].size_with_stride = output_attrs[i].size;
+    }
 
-  //   // Set output tensor memory with attributes
-  //   ret = rknn_set_io_mem(rknn_ctx, mem, &output_attrs[i]);
-  //   if (ret != RKNN_SUCC) {
-  //     LOGE(TAG, "rknn_set_io_mem fail ret=%d", ret);
-  //     return ret;
-  //   }
-  // }
+    // Create memory for this tensor
+    auto* mem = rknn_create_mem(rknn_ctx, output_attrs[i].size);
+    if (!mem) {
+      LOGE(TAG, "create output mem fail");
+      return -1;
+    }
+    output_mems.push_back(mem);
+
+    // Set output tensor memory with attributes
+    ret = rknn_set_io_mem(rknn_ctx, mem, &output_attrs[i]);
+    if (ret != RKNN_SUCC) {
+      LOGE(TAG, "rknn_set_io_mem fail ret=%d", ret);
+      return ret;
+    }
+  }
+#endif
 
 #if TEST_WITH_IMAGE
   // Load input data from binary file
@@ -764,11 +802,26 @@ int App::Inference(const rga_buffer_t* buffer) {
   // cv::Mat bgr_image(kInputHeight, MPP_ALIGN(kInputWidth, 16), CV_8UC3, buffer->vir_addr);
   // bgr_to_nhwc_float_no_norm(bgr_image, input_data);
 
+  int ret = 0;
+
+  // Prepare input
+#if USE_ZEROS_COPY
+  // Copy input data to input tensor memory
+  rknn_tensor_mem* mem = input_mems[0];
+  if (!mem) {
+    LOGE(TAG, "input mem is null");
+    return -1;
+  }
+  // Convert BGR24 to NHWC float32
+  bgr24_to_nhwc_float_stride((uint8_t*) buffer->vir_addr, kInputWidth, kInputHeight,
+                             MPP_ALIGN(kInputWidth, 16), (float*) mem->virt_addr, 1.0f);
+#else
+
   // Convert BGR24 to NHWC float32
   bgr24_to_nhwc_float_stride((uint8_t*) buffer->vir_addr, kInputWidth, kInputHeight,
                              MPP_ALIGN(kInputWidth, 16), input_data.data(), 1.0f);
 
-  // Prepare input
+  // Set input
   std::vector<rknn_input> inputs(io_num.n_input);
   inputs[0].index = 0;
   inputs[0].type = RKNN_TENSOR_FLOAT32;
@@ -776,11 +829,12 @@ int App::Inference(const rga_buffer_t* buffer) {
   inputs[0].size = kInputTensorSizeInBytes;
   inputs[0].buf = input_data.data();
 
-  auto ret = rknn_inputs_set(rknn_ctx, io_num.n_input, inputs.data());
+  ret = rknn_inputs_set(rknn_ctx, io_num.n_input, inputs.data());
   if (ret != RKNN_SUCC) {
     LOGE(TAG, "failed to set input, ret=%d", ret);
     return false;
   }
+#endif
 
   // Run inference
   ret = rknn_run(rknn_ctx, nullptr);
@@ -791,6 +845,22 @@ int App::Inference(const rga_buffer_t* buffer) {
 
   LOGI(TAG, "Inference completed successfully");
 
+#if USE_ZEROS_COPY
+  // Bounding boxes
+  const float* bboxes = reinterpret_cast<const float*>(output_mems[0]->virt_addr);
+  // Bounding box scores
+  const float* bbox_scores = reinterpret_cast<const float*>(output_mems[1]->virt_addr);
+  // Anchors, order: [4,2,3,5]
+  const float* anchors[NUM_ANCHORS] = {
+      reinterpret_cast<const float*>(output_mems[4]->virt_addr),
+      reinterpret_cast<const float*>(output_mems[2]->virt_addr),
+      reinterpret_cast<const float*>(output_mems[3]->virt_addr),
+      reinterpret_cast<const float*>(output_mems[5]->virt_addr),
+  };
+
+  // Post-process output
+  PostProcess(bboxes, bbox_scores, anchors);
+#else
   // Get output
   std::vector<rknn_output> outputs(io_num.n_output);
   for (int i = 0; i < io_num.n_output; i++) {
@@ -803,25 +873,10 @@ int App::Inference(const rga_buffer_t* buffer) {
     return false;
   }
 
-  // Post-process output
-  PostProcess(outputs);
-
-  return 0;
-}
-
-// index=0, name=bboxes, n_dims=2, dims=[1, 17200], n_elems=17200, size=34400
-// index=1, name=bboxes_scores, n_dims=2, dims=[1, 8600], n_elems=8600, size=17200
-// index=2, name=anchor3, n_dims=4, dims=[1, 25, 43, 3], n_elems=3225, size=6450
-// index=3, name=anchor2, n_dims=4, dims=[1, 25, 43, 3], n_elems=3225, size=6450
-// index=4, name=anchor1, n_dims=4, dims=[1, 25, 43, 3], n_elems=3225, size=6450
-// index=5, name=anchor4, n_dims=4, dims=[1, 25, 43, 3], n_elems=3225, size=6450
-void App::PostProcess(const std::vector<rknn_output>& outputs) {
   // Bounding boxes
   const float* bboxes = reinterpret_cast<const float*>(outputs[0].buf);
-
   // Bounding box scores
   const float* bbox_scores = reinterpret_cast<const float*>(outputs[1].buf);
-
   // Anchors, order: [4,2,3,5]
   const float* anchors[NUM_ANCHORS] = {
       reinterpret_cast<const float*>(outputs[4].buf),
@@ -830,6 +885,20 @@ void App::PostProcess(const std::vector<rknn_output>& outputs) {
       reinterpret_cast<const float*>(outputs[5].buf),
   };
 
+  // Post-process output
+  PostProcess(bboxes, bbox_scores, anchors);
+#endif
+
+  return ret;
+}
+
+// index=0, name=bboxes, n_dims=2, dims=[1, 17200], n_elems=17200, size=34400
+// index=1, name=bboxes_scores, n_dims=2, dims=[1, 8600], n_elems=8600, size=17200
+// index=2, name=anchor3, n_dims=4, dims=[1, 25, 43, 3], n_elems=3225, size=6450
+// index=3, name=anchor2, n_dims=4, dims=[1, 25, 43, 3], n_elems=3225, size=6450
+// index=4, name=anchor1, n_dims=4, dims=[1, 25, 43, 3], n_elems=3225, size=6450
+// index=5, name=anchor4, n_dims=4, dims=[1, 25, 43, 3], n_elems=3225, size=6450
+void App::PostProcess(const float* bboxes, const float* bbox_scores, const float* const* anchors) {
   DetectedActions valid_detections;
   for (int p = 0; p < NUM_CANDIDATES; ++p) {
     float detection_conf = bbox_scores[p * 2 + 1];  // score for person detection
