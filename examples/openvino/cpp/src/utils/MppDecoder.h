@@ -5,28 +5,23 @@
 #ifndef GSTREAMERANDROID_MEDIACORE_SRC_MAIN_CPP_UTILS_MPPDECODER_H_
 #define GSTREAMERANDROID_MEDIACORE_SRC_MAIN_CPP_UTILS_MPPDECODER_H_
 
+#include <atomic>
 #include <cstring>
 #include <memory>
-#include <atomic>
-#include <thread>
 #include <queue>
-
-#include "rk_mpi.h"
-#include "mpp_frame.h"
+#include <thread>
 
 #include "../VideoSink.h"
 #include "RingBuffer.h"
+#include "mpp_frame.h"
+#include "rk_mpi.h"
 
 namespace v_dec {
-typedef void(*MppDecoderMtFrameCallback)(void *userdata,
-										 RK_U32 width_stride,
-										 RK_U32 height_stride,
-										 RK_U32 width,
-										 RK_U32 height,
-										 MppFrameFormat format,
-										 int fd);
+typedef void (*MppDecoderMtFrameCallback)(void* userdata, RK_U32 width_stride, RK_U32 height_stride,
+                                          RK_U32 width, RK_U32 height, MppFrameFormat format,
+                                          int fd);
 
-typedef void *DecBufMgr;
+typedef void* DecBufMgr;
 
 enum MppDecBufMode {
   MPP_DEC_BUF_HALF_INT,
@@ -38,59 +33,59 @@ enum MppDecBufMode {
 class BufferPool {
  public:
   explicit BufferPool(size_t pool_size, size_t max_buffer_size)
-	  : pool_size_(pool_size), max_buffer_size_(max_buffer_size) {
-	for (size_t i = 0; i < pool_size_; ++i) {
-	  auto data = (char *)malloc(max_buffer_size_);
-	  auto packet = new VideoBuffSlot();
-	  if (data && packet) {
-		packet->data = data;
-		packet->size = (int)max_buffer_size_;
-		pool_.push(packet);
-	  } else {
-		if (data) {
-		  free(data);
-		}
-		delete packet;
-	  }
-	}
+      : pool_size_(pool_size), max_buffer_size_(max_buffer_size) {
+    for (size_t i = 0; i < pool_size_; ++i) {
+      auto data = (char*) malloc(max_buffer_size_);
+      auto packet = new VideoBuffSlot();
+      if (data && packet) {
+        packet->data = data;
+        packet->size = (int) max_buffer_size_;
+        pool_.push(packet);
+      } else {
+        if (data) {
+          free(data);
+        }
+        delete packet;
+      }
+    }
   }
 
   ~BufferPool() {
-	std::lock_guard<std::mutex> lock(mutex_);
-	while (!pool_.empty()) {
-	  auto packet = pool_.front();
-	  free(packet->data);
-	  pool_.pop();
-	}
+    std::lock_guard<std::mutex> lock(mutex_);
+    while (!pool_.empty()) {
+      auto packet = pool_.front();
+      free(packet->data);
+      pool_.pop();
+    }
   }
 
   VideoBuffSlot* Acquire(size_t size) {
-	std::unique_lock<std::mutex> lock(mutex_);
-	if (size > max_buffer_size_) {
-	  // Allocate a packet for large size dynamically
-	  auto packet = new VideoBuffSlot();
-	  packet->data = (char *)malloc(size);
-	  packet->size = (int)size;
-	  return packet;
-	} else {
-	  cv_.wait(lock, [this]() { return !pool_.empty(); });
-	  auto packet = pool_.front();
-	  pool_.pop();
-	  packet->size = (int)size;
-	  return packet;
-	}
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (size > max_buffer_size_) {
+      // Allocate a packet for large size dynamically
+      auto packet = new VideoBuffSlot();
+      packet->data = (char*) malloc(size);
+      packet->size = (int) size;
+      return packet;
+    } else {
+      cv_.wait(lock, [this]() { return !pool_.empty(); });
+      auto packet = pool_.front();
+      pool_.pop();
+      packet->size = (int) size;
+      return packet;
+    }
   }
 
   void Release(VideoBuffSlot* packet) {
-	std::lock_guard<std::mutex> lock(mutex_);
-	if (packet->size > max_buffer_size_) {
-	  // Free dynamically allocated packet
-	  free(packet->data);
-	  delete packet;
-	} else {
-	  pool_.push(packet);
-	  cv_.notify_one();
-	}
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (packet->size > max_buffer_size_) {
+      // Free dynamically allocated packet
+      free(packet->data);
+      delete packet;
+    } else {
+      pool_.push(packet);
+      cv_.notify_one();
+    }
   }
 
  private:
@@ -103,13 +98,13 @@ class BufferPool {
 
 class MppDecoder {
  public:
-  MppDecoder(MppCodingType type, RK_U32 width, RK_U32 height, void *user_data);
+  MppDecoder(MppCodingType type, RK_U32 width, RK_U32 height, void* user_data);
   ~MppDecoder();
 
-  void PutPacket(const void *data, size_t size, RK_U32 eos = 0);
+  void PutPacket(const void* data, size_t size, RK_U32 eos = 0);
 
   void SetCallback(MppDecoderMtFrameCallback callback) {
-	callback_ = callback;
+    callback_ = callback;
   }
 
  private:
@@ -122,7 +117,7 @@ class MppDecoder {
   MppDecBufMode buf_mode_;
 
   MppCtx ctx_;
-  MppApi *mpi_;
+  MppApi* mpi_;
 
   std::atomic<bool> loop_end_;
   /* input and output */
@@ -141,18 +136,18 @@ class MppDecoder {
   std::unique_ptr<std::thread> dec_output_thread_;
 
   // callback
-  void *user_data_;
+  void* user_data_;
   MppDecoderMtFrameCallback callback_;
 
   void InitDecoderData();
   void DeInitDecoderData();
 
-  void DecodeNow(const void *data, size_t size, RK_U32 eos);
+  void DecodeNow(const void* data, size_t size, RK_U32 eos);
   // decoding threads
   void Feed();
   void Decode();
 
   bool CommitBufferGroup(RK_U32 w, RK_U32 h, size_t size);
 };
-} // namespace v_dec
-#endif //GSTREAMERANDROID_MEDIACORE_SRC_MAIN_CPP_UTILS_MPPDECODER_H_
+}  // namespace v_dec
+#endif  // GSTREAMERANDROID_MEDIACORE_SRC_MAIN_CPP_UTILS_MPPDECODER_H_

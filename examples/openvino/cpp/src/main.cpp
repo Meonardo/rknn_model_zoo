@@ -9,6 +9,7 @@
 #include <numeric>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 // OpenCV
@@ -17,12 +18,18 @@
 
 #include "Common.h"
 #include "rknn_api.h"
+#include "utils/MppDecoder.h"
+#include "utils/RgaBufferPool.h"
 
 #define MODEL_PATH "/data/local/tmp/lldb-standalone/student_action_recognition.rknn"
 #define TEST_BIN_FILE_PATH "/data/local/tmp/lldb-standalone/test_680_400_bgr.bin"
 #define TEST_IMG_FILE_PATH "/data/local/tmp/lldb-standalone/test_680_400.jpg"
+#define TEST_VID_FILE_PATH "/data/local/tmp/lldb-standalone/test_1920_1080.h264"
+#define BGR_FILE_PATH "/data/local/tmp/lldb-standalone/inference_680_400_bgr.bmp"
 
 #define TAG "App"
+
+#define TEST_WITH_IMAGE 0
 
 struct NormalizedBBox {
   float xmin;
@@ -61,6 +68,7 @@ constexpr float ACTION_CONF_THRESHOLD = 0.75f;
 constexpr size_t TOP_K = 200;
 constexpr float NMS_SIGMA = 0.6f;
 constexpr int NUM_CANDIDATES = 4300;  // 43*25*4
+constexpr const char* ACTION_CLASS_LIST[NUM_ACTIONS] = {"Sitting", "Standing", "RaisingHand"};
 
 static NormalizedBBox generate_prior_box(int pos, int step, const cv::Size2f& anchor,
                                          const cv::Size& blob_size) {
@@ -247,6 +255,23 @@ static void bgr24_to_nhwc_float(const uint8_t* src, int W, int H, float* dst, fl
   }
 }
 
+// Convert BGR24 to NHWC float32 with stride support
+static void bgr24_to_nhwc_float_stride(const uint8_t* src, int W, int H, int stride, float* dst,
+                                       float scale) {
+  // stride: number of bytes per row (may be larger than W*3)
+  // NHWC layout: dst[(y * W + x) * 3 + c]
+  for (int y = 0; y < H; ++y) {
+    const uint8_t* row = src + static_cast<size_t>(y) * stride * 3;
+    for (int x = 0; x < W; ++x) {
+      const size_t idx = ((size_t) y * W + x) * 3;
+      // Use row[3*x + c] for BGR, but only up to W*3 bytes per row
+      dst[idx + 0] = static_cast<float>(row[3 * x + 0]) * scale;  // B
+      dst[idx + 1] = static_cast<float>(row[3 * x + 1]) * scale;  // G
+      dst[idx + 2] = static_cast<float>(row[3 * x + 2]) * scale;  // R
+    }
+  }
+}
+
 static bool read_file(const std::string& path, std::vector<uint8_t>& buf) {
   std::ifstream f(path, std::ios::binary | std::ios::ate);
   if (!f) {
@@ -285,7 +310,7 @@ static void bgr_to_nchw_float_no_norm(const cv::Mat& img, std::vector<float>& ou
 }
 
 void bgr_to_nhwc_float_no_norm(const cv::Mat& img, std::vector<float>& out) {
-  CV_Assert(img.type() == CV_8UC3 && img.cols == kInputWidth && img.rows == kInputHeight);
+  // CV_Assert(img.type() == CV_8UC3 && img.cols == kInputWidth && img.rows == kInputHeight);
   const int W = kInputWidth, H = kInputHeight;
   out.resize(1 * H * W * 3);  // NHWC
 
@@ -303,9 +328,9 @@ void bgr_to_nhwc_float_no_norm(const cv::Mat& img, std::vector<float>& out) {
   }
 }
 
-////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////
 // App class
-////////////////////////////////////////////////////////////////////////////////
+struct VideoFileCapturer;  // Forward declaration
 struct App {
   std::atomic<bool> running;
 
@@ -319,22 +344,230 @@ struct App {
   std::vector<float> input_data;
   bool input_data_ready = false;
 
-  App(const char* model_path);
+  std::unique_ptr<VideoFileCapturer> capturer = nullptr;
+  std::unique_ptr<std::thread> worker = nullptr;
+
+  explicit App(const char* model_path);
   ~App();
 
   int Init(const char* model_path);
   void DeInit();
-  int Inference();
+  int Inference(const rga_buffer_t* buffer);
   void PostProcess(const std::vector<rknn_output>& outputs);
+  void OnDecodedFrame(const VideoFrameSlot& frame);
 
+  bool Start();
+  void Stop();
+  void MainLoop();
+
+#if TEST_WITH_IMAGE
   // Load input data from binary file
   int LoadTestData(const std::string& bin_path, std::vector<float>& input_data);
   // Load input data from image file(backend is OpenCV)
   int LoadTestImage(const std::string& img_path, std::vector<float>& input_data);
+#endif
+
+ private:
+  // buffers
+  std::unique_ptr<RingBuffer<VideoFrameSlot>> ring_buffer_;
+  std::unique_ptr<RgaBufferPool> scale_buffer_pool_;
+  std::unique_ptr<RgaBufferPool> rgb_buffer_pool_;
+  std::unordered_map<int, std::unique_ptr<rga_buffer_t>> rga_buffers_;
+  int last_success_fd_;
+  std::atomic<bool> ready_;
+
+  static bool ImportRgaBuffer(const VideoFrameSlot& frame, rga_buffer_t* buffer);
+  rga_buffer_t* Scale(rga_buffer_t* src);
+  rga_buffer_t* GetImportedRgaBuffer();
 };
 
-std::unique_ptr<App> app_instance;
+/////////////////////////////////////////////////////////////////////////////////////////
+// VideoFileCapturer: Capture video frames from a H.264 encoded video file, decode
+struct VideoFileCapturer {
+  std::atomic<bool> running;
+  std::unique_ptr<std::thread> worker;
+  std::string path;
+  std::unique_ptr<v_dec::MppDecoder> decoder;
+  uint32_t frame_width;
+  uint32_t frame_height;
+  uint16_t fps;
+  bool cycle_mode;
 
+  explicit VideoFileCapturer(const std::string& path, void* user_data);
+  ~VideoFileCapturer();
+
+  bool Start();
+  void Stop();
+
+ private:
+  void CaptureLoop();
+  static void SplitH264Packet(int32_t* read_len, uint8_t* buf, size_t buf_size, int32_t used_bytes);
+};
+
+VideoFileCapturer::VideoFileCapturer(const std::string& filepath, void* user_data)
+    : running(false),
+      worker(nullptr),
+      path(filepath),
+      decoder(std::make_unique<v_dec::MppDecoder>(MPP_VIDEO_CodingAVC, kBaseVideoWidth,
+                                                  kBaseVideoHeight, user_data)),
+      frame_width(kBaseVideoWidth),
+      frame_height(kBaseVideoHeight),
+      fps(25),
+      cycle_mode(true) {
+  decoder->SetCallback([](void* userdata, RK_U32 width_stride, RK_U32 height_stride, RK_U32 width,
+                          RK_U32 height, MppFrameFormat format, int fd) {
+    auto* app = reinterpret_cast<App*>(userdata);
+    app->OnDecodedFrame({width, height, width_stride, height_stride, format, fd});
+  });
+}
+
+VideoFileCapturer::~VideoFileCapturer() {
+  Stop();
+}
+
+bool VideoFileCapturer::Start() {
+  if (running.load()) {
+    LOGW(TAG, "video capturer already running");
+    return false;
+  }
+
+  running.store(true);
+  worker = std::make_unique<std::thread>(&VideoFileCapturer::CaptureLoop, this);
+  return true;
+}
+
+void VideoFileCapturer::Stop() {
+  if (!running.load()) {
+    LOGW(TAG, "video capturer not running");
+    return;
+  }
+
+  running.store(false);
+  if (worker && worker->joinable()) {
+    worker->join();
+    worker.reset();
+  }
+
+  // send EOS to video decoder
+  if (decoder != nullptr) {
+    decoder->PutPacket(nullptr, 0, 1);
+  }
+}
+
+void VideoFileCapturer::SplitH264Packet(int32_t* read_len, uint8_t* buf, size_t buf_size,
+                                        int32_t used_bytes) {
+  int32_t i;
+  bool find_start = false;
+  bool find_end = false;
+  bool new_pic;
+  /* H264 frame start marker */
+  if (*read_len > buf_size) {
+    LOGE(TAG, "Read length %d exceeds minimum buffer size %lu", *read_len, buf_size);
+    return;
+  }
+
+  for (i = 0; i < *read_len - 8; i++) { /* 8:h264 frame start code length */
+    int tmp = buf[i + 3] & 0x1F;        /* 3:index  0x1F:frame start marker */
+    new_pic =
+        (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 && /* 1 2:index */
+         (((tmp == 0x5 || tmp == 0x1) &&
+           ((buf[i + 4] & 0x80) == 0x80)) ||            /* 4:index 0x5 0x80:frame start mark */
+          (tmp == 20 && (buf[i + 7] & 0x80) == 0x80))); /* 20 0x1 0x80:frame start marker 7:index */
+    if (new_pic) {
+      find_start = true;
+      i += 8; /* 8:h264 frame start code length */
+      break;
+    }
+  }
+
+  for (; i < *read_len - 8; i++) { /* 8:h264 frame start code length */
+    int tmp = buf[i + 3] & 0x1F;   /* 3:index  0x1F:frame start marker */
+    new_pic =
+        (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 && /* 1 2:index */
+         (tmp == 15 || tmp == 7 || tmp == 8 || tmp == 6 ||    /* 15 7 8 6:frame start marker */
+          ((tmp == 5 || tmp == 1) &&
+           ((buf[i + 4] & 0x80) == 0x80)) ||            /* 4:index 5 0x80:frame start marker */
+          (tmp == 20 && (buf[i + 7] & 0x80) == 0x80))); /* 7:index 20 0x80:frame start marker */
+    if (new_pic) {
+      find_end = true;
+      break;
+    }
+  }
+
+  if (i > 0) {
+    *read_len = i;
+  }
+  if (!find_start) {
+    LOGE(TAG, "Cannot find H264 start code! Read length: %d, Used bytes: %d", *read_len,
+         used_bytes);
+  }
+  if (!find_end) {
+    *read_len = i + 8; /* 8:h264 frame start code length */
+  }
+  return;
+}
+
+void VideoFileCapturer::CaptureLoop() {
+  FILE* input_file = fopen(path.c_str(), "rb");
+  if (!input_file) {
+    LOGE(TAG, "Failed to open input file: %s", path.c_str());
+    return;
+  }
+  LOGI(TAG, "Opened input file: %s", path.c_str());
+
+  const size_t buffer_size = (frame_width * frame_height * 3) >> 1;
+  uint8_t* buffer = new uint8_t[buffer_size];
+  int32_t used_bytes = 0, read_len = 0;
+
+  LOGD(TAG, "Video capture loop started");
+  while (running.load()) {
+    auto begin = std::chrono::steady_clock::now();
+
+    // Read H.264 frame from file
+    fseek(input_file, used_bytes, SEEK_SET);
+    read_len = fread(buffer, 1, buffer_size, input_file);
+
+    if (read_len == 0) {
+      if (!cycle_mode) {
+        LOGI(TAG, "End of stream reached, exiting capture loop");
+        break;
+      }
+
+      LOGW(TAG, "End of stream reached, restarting from the beginning of the file: %s",
+           path.c_str());
+
+      used_bytes = 0;  // Reset to start reading from the beginning
+      fseek(input_file, 0, SEEK_SET);
+      read_len = fread(buffer, 1, buffer_size, input_file);
+    }
+
+    // Split buffer
+    SplitH264Packet(&read_len, buffer, buffer_size, used_bytes);
+
+    // Decode frame
+    decoder->PutPacket(buffer, read_len, 0);
+
+    used_bytes += read_len;
+
+    // Sleep to simulate real-time frame rate
+    auto end = std::chrono::steady_clock::now();
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
+    auto frame_duration_ms = 1000 / fps;
+    if (elapsed_ms < frame_duration_ms) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(frame_duration_ms - elapsed_ms));
+    } else {
+      LOGW(TAG, "Processing time %lld ms exceeds frame duration %d ms", elapsed_ms,
+           frame_duration_ms);
+    }
+  }
+
+  delete[] buffer;
+  fclose(input_file);
+
+  LOGD(TAG, "Video capture loop exited");
+}
+
+////////////////////////////////////////////////////////////////////////////////
 App::App(const char* model_path) : running(false), input_data(kInputTensorSize) {
   auto ret = Init(model_path);
   if (ret == 0) {
@@ -444,12 +677,23 @@ int App::Init(const char* model_path) {
   //     return ret;
   //   }
   // }
+
+#if TEST_WITH_IMAGE
   // Load input data from binary file
   if (LoadTestData(TEST_BIN_FILE_PATH, input_data) != 0) {
     LOGE(TAG, "Failed to load input data from binary file");
     return -1;
   }
   input_data_ready = true;
+#else
+  // create ring buffer
+  ring_buffer_ = std::make_unique<RingBuffer<VideoFrameSlot>>(kDefaultRingBufferSize);
+  // create rga buffer pools
+  rgb_buffer_pool_ = std::make_unique<RgaBufferPool>(kMaxDecodedFrameBufferCount, RK_FORMAT_BGR_888,
+                                                     kInputWidth, kInputHeight);
+  scale_buffer_pool_ = std::make_unique<RgaBufferPool>(
+      kMaxDecodedFrameBufferCount, RK_FORMAT_YCbCr_420_SP, kInputWidth, kInputHeight);
+#endif
 
   return 0;
 }
@@ -473,6 +717,7 @@ void App::DeInit() {
   LOGI(TAG, "App deinitialized successfully");
 }
 
+#if TEST_WITH_IMAGE
 // Load input data from binary file
 int App::LoadTestData(const std::string& bin_path, std::vector<float>& input_data) {
   // Read entire input
@@ -500,13 +745,29 @@ int App::LoadTestImage(const std::string& img_path, std::vector<float>& input_da
 
   return 0;
 }
+#endif
 
-int App::Inference() {
+int App::Inference(const rga_buffer_t* buffer) {
+#if TEST_WITH_IMAGE
   if (!input_data_ready) {
     LOGE(TAG, "Input data is not ready");
     return -1;
   }
-  
+#endif
+
+#if 0
+  cv::Mat bgr_image(kInputHeight, MPP_ALIGN(kInputWidth, 16), CV_8UC3, buffer->vir_addr);
+  if (!cv::imwrite(BGR_FILE_PATH, bgr_image)) {
+    LOGE(TAG, "Failed to write BGR image to file: %s", BGR_FILE_PATH);
+  }
+#endif
+  // cv::Mat bgr_image(kInputHeight, MPP_ALIGN(kInputWidth, 16), CV_8UC3, buffer->vir_addr);
+  // bgr_to_nhwc_float_no_norm(bgr_image, input_data);
+
+  // Convert BGR24 to NHWC float32
+  bgr24_to_nhwc_float_stride((uint8_t*) buffer->vir_addr, kInputWidth, kInputHeight,
+                             MPP_ALIGN(kInputWidth, 16), input_data.data(), 1.0f);
+
   // Prepare input
   std::vector<rknn_input> inputs(io_num.n_input);
   inputs[0].index = 0;
@@ -605,6 +866,8 @@ void App::PostProcess(const std::vector<rknn_output>& outputs) {
     if (action_label < 0 || action_conf < ACTION_CONF_THRESHOLD) {
       action_label = 0;
       action_conf = 0.f;
+    } else {
+      LOGD(TAG, "Detected action: %s, conf: %.3f", ACTION_CLASS_LIST[action_label], action_conf);
     }
 
     // Prior boxes
@@ -627,6 +890,182 @@ void App::PostProcess(const std::vector<rknn_output>& outputs) {
 
   LOGI(TAG, "Detections after NMS: %lu", out_det_indices.size());
 }
+
+void App::OnDecodedFrame(const VideoFrameSlot& frame) {
+  if (frame.eos) {
+    ready_.store(false);
+    LOGW(TAG, "detect eos");
+    return;
+  }
+
+  // save to ring buffer
+  ring_buffer_->Enqueue(frame);
+
+  // check need refresh
+  if (frame.need_refresh) {
+    LOGW(TAG, "need refresh");
+    ready_.store(false);
+    // release all imported rga buffers
+    for (auto& [key, buffer] : rga_buffers_) {
+      releasebuffer_handle(buffer->handle);
+    }
+    rga_buffers_.clear();
+  }
+
+  auto count = rga_buffers_.count(frame.fd);
+  if (count == 0) {
+    auto buffer = std::make_unique<rga_buffer_t>();
+    if (ImportRgaBuffer(frame, buffer.get())) {
+      rga_buffers_[frame.fd] = std::move(buffer);
+    }
+
+    if (rga_buffers_.size() == kMaxDecodedFrameBufferCount) {
+      last_success_fd_ = frame.fd;
+
+      ready_.store(true);
+    }
+  }
+}
+
+bool App::ImportRgaBuffer(const VideoFrameSlot& frame, rga_buffer_t* buffer) {
+  im_handle_param_t handle_param;
+  handle_param.width = frame.width;
+  handle_param.height = frame.height;
+  handle_param.format = RK_FORMAT_YCbCr_420_SP;  // NV12
+
+  // get rga buffer handle from decoded buffer
+  rga_buffer_handle_t handle = importbuffer_fd(frame.fd, &handle_param);
+  if (handle <= 0) {
+    LOGE(TAG, "rga import dma buffer failed, fd=%d", frame.fd);
+    return false;
+  }
+
+  *buffer =
+      wrapbuffer_handle(handle, (int) frame.width, (int) frame.height, (int) handle_param.format,
+                        (int) frame.width_stride, (int) frame.height_stride);
+  buffer->fd = frame.fd;
+
+  return true;
+}
+
+rga_buffer_t* App::GetImportedRgaBuffer() {
+  VideoFrameSlot frame = {0};
+  bool success = ring_buffer_->Dequeue(&frame);
+  if (success) {
+    last_success_fd_ = frame.fd;
+  }
+  if (rga_buffers_.count(last_success_fd_) == 0) {
+    return nullptr;
+  }
+  return rga_buffers_.at(last_success_fd_).get();
+}
+
+rga_buffer_t* App::Scale(rga_buffer_t* src) {
+  rga_buffer_t* scale_dst = scale_buffer_pool_->Acquire();
+  if (scale_dst == nullptr) {
+    LOGE(TAG, "failed to acquire rga buffer");
+    return nullptr;
+  }
+
+  im_rect rect = {0, 0, (int) kInputWidth, (int) kInputHeight};
+  auto ret = imcheck(*src, *scale_dst, {}, rect);
+  if (IM_STATUS_NOERROR != ret) {
+    LOGE(TAG, "scale to file check failed, %s", imStrError(ret));
+    return nullptr;
+  }
+
+  ret = improcess(*src, *scale_dst, {}, {}, rect, {}, IM_SYNC);
+  if (IM_STATUS_SUCCESS != ret) {
+    LOGE(TAG, "scale to file failed, %s", imStrError(ret));
+    return nullptr;
+  }
+
+  rga_buffer_t* dst = rgb_buffer_pool_->Acquire();
+  if (dst == nullptr) {
+    LOGE(TAG, "failed to acquire rga buffer");
+    return nullptr;
+  }
+
+  ret = imcvtcolor(*scale_dst, *dst, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_BGR_888);
+  if (IM_STATUS_SUCCESS != ret) {
+    LOGE(TAG, "convert to rgb888 failed, %s", imStrError(ret));
+    return nullptr;
+  }
+
+  return dst;
+}
+
+bool App::Start() {
+  if (running.load()) {
+    LOGW(TAG, "App already running");
+    return false;
+  }
+
+  if (!capturer) {
+    capturer = std::make_unique<VideoFileCapturer>(TEST_VID_FILE_PATH, this);
+    if (!capturer->Start()) {
+      LOGE(TAG, "Failed to start video capturer");
+      return false;
+    }
+  }
+
+  running.store(true);
+  worker = std::make_unique<std::thread>(&App::MainLoop, this);
+  return true;
+}
+
+void App::Stop() {
+  if (!running.load()) {
+    LOGW(TAG, "App not running");
+    return;
+  }
+
+  if (capturer) {
+    capturer->Stop();
+    capturer.reset();
+  }
+
+  running.store(false);
+  if (worker && worker->joinable()) {
+    worker->join();
+    worker.reset();
+  }
+}
+
+void App::MainLoop() {
+  LOGI(TAG, "App main loop started");
+
+  while (running.load()) {
+    if (!ready_.load()) {
+      // frames are not ready for use, wait for a while
+      std::this_thread::sleep_for(std::chrono::milliseconds(kDefaultWaitingTimeInMs));
+      continue;
+    }
+
+    auto src_buffer = GetImportedRgaBuffer();
+    if (src_buffer == nullptr) {
+      LOGE(TAG, "failed to get imported rga buffer");
+      std::this_thread::sleep_for(std::chrono::milliseconds(kDefaultWaitingTimeInMs));
+      continue;
+    }
+
+    // do letter boxing
+    auto dest_buffer = Scale(src_buffer);
+    if (dest_buffer == nullptr) {
+      LOGE(TAG, "failed to do letter boxing");
+      std::this_thread::sleep_for(std::chrono::milliseconds(kDefaultWaitingTimeInMs));
+      continue;
+    }
+
+    // do inference
+    Inference(dest_buffer);
+  }
+
+  LOGI(TAG, "App main loop exited");
+}
+
+/////////////////////////////////////////////////////////////////////////////////
+std::unique_ptr<App> app_instance;  // Global app instance
 
 // handle abnormal termination signals
 static void handle_sig(int32_t signo) {
@@ -660,14 +1099,19 @@ int main(int argc, char* argv[]) {
   // Create Application
   app_instance = std::make_unique<App>(MODEL_PATH);
 
-  // Enter main loop
-  app_instance->running.store(true);
+  if (!app_instance->Start()) {
+    LOGE(TAG, "Failed to start application");
+    return -1;
+  }
+
+  // Main loop
   while (app_instance->running.load()) {
-    // std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    app_instance->Inference();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 
   // Release resources
+  app_instance->Stop();
+
   app_instance.reset();
 
   return 0;
