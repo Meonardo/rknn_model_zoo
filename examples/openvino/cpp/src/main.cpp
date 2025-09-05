@@ -19,6 +19,7 @@
 #include "Common.h"
 #include "rknn_api.h"
 #include "utils/MppDecoder.h"
+#include "utils/MppEncoder.h"
 #include "utils/RgaBufferPool.h"
 
 #define MODEL_PATH "/data/local/tmp/lldb-standalone/student_action_recognition.rknn"
@@ -351,7 +352,8 @@ void bgr_to_nhwc_float_no_norm(const cv::Mat& img, std::vector<float>& out) {
 
 /////////////////////////////////////////////////////////////////////////////////////////
 // App class
-struct VideoFileCapturer;  // Forward declaration
+struct VideoFileReader;  // Forward declaration
+struct VideoFileWriter;  // Forward declaration
 struct App {
   std::atomic<bool> running;
 
@@ -365,7 +367,7 @@ struct App {
   std::vector<float> input_data;
   bool input_data_ready = false;
 
-  std::unique_ptr<VideoFileCapturer> capturer = nullptr;
+  std::unique_ptr<VideoFileReader> capturer = nullptr;
   std::unique_ptr<std::thread> worker = nullptr;
 
   explicit App(const char* model_path);
@@ -398,13 +400,13 @@ struct App {
   std::atomic<bool> ready_;
 
   static bool ImportRgaBuffer(const VideoFrameSlot& frame, rga_buffer_t* buffer);
-  rga_buffer_t* Scale(rga_buffer_t* src);
+  rga_buffer_t* ScaleConvert(rga_buffer_t* src);
   rga_buffer_t* GetImportedRgaBuffer();
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////
-// VideoFileCapturer: Capture video frames from a H.264 encoded video file, decode
-struct VideoFileCapturer {
+// VideoFileReader: Capture video frames from a H.264 encoded video file, decode
+struct VideoFileReader {
   std::atomic<bool> running;
   std::unique_ptr<std::thread> worker;
   std::string path;
@@ -414,8 +416,8 @@ struct VideoFileCapturer {
   uint16_t fps;
   bool cycle_mode;
 
-  explicit VideoFileCapturer(const std::string& path, void* user_data);
-  ~VideoFileCapturer();
+  explicit VideoFileReader(const std::string& path, void* user_data);
+  ~VideoFileReader();
 
   bool Start();
   void Stop();
@@ -425,7 +427,77 @@ struct VideoFileCapturer {
   static void SplitH264Packet(int32_t* read_len, uint8_t* buf, size_t buf_size, int32_t used_bytes);
 };
 
-VideoFileCapturer::VideoFileCapturer(const std::string& filepath, void* user_data)
+/////////////////////////////////////////////////////////////////////////////////////////
+// VideoFileWriter: Write video frames to a H.264 encoded video file
+struct VideoFileWriter {
+  std::string path;
+  std::unique_ptr<v_enc::MppEncoder> encoder;
+  EncodedVideoInfo enc_info;
+
+  explicit VideoFileWriter(const std::string& path, uint32_t width, uint32_t height, int fps);
+  ~VideoFileWriter();
+
+  void WriteFrame(const VideoFrameSlot& frame);
+
+ private:
+  FILE* fp_;
+  void OnEncodedData(const char* data, size_t size);
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////
+
+VideoFileWriter::VideoFileWriter(const std::string& path, uint32_t width, uint32_t height, int fps)
+    : path(path), enc_info{} {
+  fp_ = fopen(path.c_str(), "wb");
+  if (fp_ == nullptr) {
+    LOGE(TAG, "Failed to open output file: %s", path.c_str());
+    assert(false);
+  }
+
+  enc_info.width = width;
+  enc_info.height = height;
+  enc_info.fps = fps;
+  enc_info.codec = 0;  // H.264
+  encoder = std::make_unique<v_enc::MppEncoder>(enc_info, this);
+  encoder->SetCallback([](void* userdata, const char* data, size_t size) {
+    auto* writer = reinterpret_cast<VideoFileWriter*>(userdata);
+    writer->OnEncodedData(data, size);
+  });
+}
+
+VideoFileWriter::~VideoFileWriter() {
+  if (encoder) {
+    encoder->Stop();
+    encoder.reset();
+  }
+
+  if (fp_) {
+    fflush(fp_);
+    fclose(fp_);
+    fp_ = nullptr;
+  }
+}
+
+void VideoFileWriter::WriteFrame(const VideoFrameSlot& frame) {
+  if (encoder) {
+    encoder->Encode(frame);
+  }
+}
+
+void VideoFileWriter::OnEncodedData(const char* data, size_t size) {
+  if (fp_ == nullptr) {
+    LOGE(TAG, "Can not write to file: %s", path.c_str());
+    return;
+  }
+
+  if (data && size > 0) {
+    fwrite(data, 1, size, fp_);
+  }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////
+
+VideoFileReader::VideoFileReader(const std::string& filepath, void* user_data)
     : running(false),
       worker(nullptr),
       path(filepath),
@@ -442,41 +514,42 @@ VideoFileCapturer::VideoFileCapturer(const std::string& filepath, void* user_dat
   });
 }
 
-VideoFileCapturer::~VideoFileCapturer() {
+VideoFileReader::~VideoFileReader() {
   Stop();
 }
 
-bool VideoFileCapturer::Start() {
+bool VideoFileReader::Start() {
   if (running.load()) {
     LOGW(TAG, "video capturer already running");
     return false;
   }
 
   running.store(true);
-  worker = std::make_unique<std::thread>(&VideoFileCapturer::CaptureLoop, this);
+  worker = std::make_unique<std::thread>(&VideoFileReader::CaptureLoop, this);
   return true;
 }
 
-void VideoFileCapturer::Stop() {
+void VideoFileReader::Stop() {
   if (!running.load()) {
     LOGW(TAG, "video capturer not running");
     return;
-  }
-
-  running.store(false);
-  if (worker && worker->joinable()) {
-    worker->join();
-    worker.reset();
   }
 
   // send EOS to video decoder
   if (decoder != nullptr) {
     decoder->PutPacket(nullptr, 0, 1);
   }
+
+  // stop capture thread
+  running.store(false);
+  if (worker && worker->joinable()) {
+    worker->join();
+    worker.reset();
+  }
 }
 
-void VideoFileCapturer::SplitH264Packet(int32_t* read_len, uint8_t* buf, size_t buf_size,
-                                        int32_t used_bytes) {
+void VideoFileReader::SplitH264Packet(int32_t* read_len, uint8_t* buf, size_t buf_size,
+                                      int32_t used_bytes) {
   int32_t i;
   bool find_start = false;
   bool find_end = false;
@@ -528,7 +601,7 @@ void VideoFileCapturer::SplitH264Packet(int32_t* read_len, uint8_t* buf, size_t 
   return;
 }
 
-void VideoFileCapturer::CaptureLoop() {
+void VideoFileReader::CaptureLoop() {
   FILE* input_file = fopen(path.c_str(), "rb");
   if (!input_file) {
     LOGE(TAG, "Failed to open input file: %s", path.c_str());
@@ -1029,7 +1102,7 @@ rga_buffer_t* App::GetImportedRgaBuffer() {
   return rga_buffers_.at(last_success_fd_).get();
 }
 
-rga_buffer_t* App::Scale(rga_buffer_t* src) {
+rga_buffer_t* App::ScaleConvert(rga_buffer_t* src) {
   rga_buffer_t* scale_dst = scale_buffer_pool_->Acquire();
   if (scale_dst == nullptr) {
     LOGE(TAG, "failed to acquire rga buffer");
@@ -1071,7 +1144,7 @@ bool App::Start() {
   }
 
   if (!capturer) {
-    capturer = std::make_unique<VideoFileCapturer>(TEST_VID_FILE_PATH, this);
+    capturer = std::make_unique<VideoFileReader>(TEST_VID_FILE_PATH, this);
     if (!capturer->Start()) {
       LOGE(TAG, "Failed to start video capturer");
       return false;
@@ -1119,7 +1192,7 @@ void App::MainLoop() {
     }
 
     // do letter boxing
-    auto dest_buffer = Scale(src_buffer);
+    auto dest_buffer = ScaleConvert(src_buffer);
     if (dest_buffer == nullptr) {
       LOGE(TAG, "failed to do letter boxing");
       std::this_thread::sleep_for(std::chrono::milliseconds(kDefaultWaitingTimeInMs));
