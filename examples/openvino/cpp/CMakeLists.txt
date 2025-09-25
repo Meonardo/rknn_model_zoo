@@ -40,11 +40,15 @@ set(MPP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/mpp")
 set(OSAL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/osal")
 set(CV_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/opencv-4.10.0")
 
-set(SOURCE_FILES
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/src/onvif)
 
-        src/main.cpp
+set(SRC_FILES
 
         src/VideoSink.cpp
+        src/OnvifCore.cpp
+        src/OnvifSink.cpp
+        src/RtspSource.cpp
+
         src/utils/DmaAlloc.cpp
         src/utils/MppDecoder.cpp
         src/utils/MppEncoder.cpp
@@ -55,7 +59,7 @@ if (ANDROID_APK)
     add_library(${CMAKE_PROJECT_NAME}
             SHARED
 
-            ${SOURCE_FILES}
+            ${SRC_FILES}
     )
     target_compile_definitions(
             ${CMAKE_PROJECT_NAME}
@@ -64,9 +68,15 @@ if (ANDROID_APK)
             ANDROID_APK
     )
 else ()
+    if (DET_TYPE STREQUAL "ACTION")
+        list(APPEND SRC_FILES src/ActionDetection.cpp)
+    else ()
+        list(APPEND SRC_FILES src/SignDetection.cpp)
+    endif ()
+
     add_executable(
             ${CMAKE_PROJECT_NAME}
-            ${SOURCE_FILES}
+            ${SRC_FILES}
     )
 endif ()
 
@@ -99,6 +109,9 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
         ${CV_ROOT}/libs/libopencv_video.a
         ${CV_ROOT}/libs/libopencv_photo.a
         ${CV_ROOT}/libs/libopencv_highgui.a
+
+        # ONVIF
+        onvif
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME}
@@ -112,4 +125,12 @@ target_include_directories(${CMAKE_PROJECT_NAME}
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/src/utils
         ${CV_ROOT}/include
+
+        # onvif
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/onvif/onvif/bm
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/onvif/onvif/onvif
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/onvif/onvif/http
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/onvif/onvif/rtp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/onvif/onvif/rtsp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/onvif/onvif/media
 )

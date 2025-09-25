@@ -55,5 +55,6 @@ examples/SlowFast/
 examples/openvino/python
 examples/openvino/model
 examples/openvino/cpp/deps
+examples/openvino/cpp/src/onvif
 examples/openvino/cpp/build
 examples/openvino/cpp/install

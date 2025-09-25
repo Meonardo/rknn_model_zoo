@@ -1226,10 +1226,6 @@ int main(int argc, char* argv[]) {
     LOGE(TAG, "Model file not found: %s", MODEL_PATH);
     return -1;
   }
-  if (!std::filesystem::exists(TEST_BIN_FILE_PATH)) {
-    LOGE(TAG, "Test file not found: %s", TEST_BIN_FILE_PATH);
-    return -1;
-  }
 
   // Add SIG handlers for graceful shutdown.
   struct sigaction sa = {};
