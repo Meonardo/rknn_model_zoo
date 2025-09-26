@@ -12,7 +12,6 @@
 #include "mpp_dmabuf.h"
 #include "mpp_time.h"
 
-#define MPP_ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 #define SZ_4K 4096
 #define TAG "MppEncoder"
 
@@ -596,7 +595,15 @@ MPP_RET MppEncoder::Encode(const VideoFrameSlot& f) {
     memset(&info, 0, sizeof(MppBufferInfo));
     info.type = MPP_BUFFER_TYPE_EXT_DMA;
     info.fd = f.fd;
-    info.size = f.width_stride * f.height_stride * 3 / 2;
+    if (f.format == MPP_FMT_YUV420SP) {
+      // YUV420SP
+      info.size = f.width_stride * f.height_stride * 3 / 2;
+    } else if (f.format == MPP_FMT_RGBA8888) {
+      // MPP_FMT_RGBA8888
+      info.size = f.width_stride * f.height_stride * 4;
+    } else {
+      info.size = f.width_stride * f.height_stride * 3;
+    }
     info.index = f.fd;
     ret = mpp_buffer_import(&buffer, &info);
     if (ret) {

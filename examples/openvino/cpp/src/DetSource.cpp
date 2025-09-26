@@ -22,8 +22,6 @@ constexpr size_t kInputTensorSizeInBytes = kInputTensorSize * sizeof(float);
 constexpr float kDetModelClassScoreThreshold = 0.85f;  // Score threshold for valid detections
 constexpr float kDetModelNmsThreshold = 0.4f;          // Non-Maximum Suppression threshold
 
-constexpr uint16_t kNumOfClasses = 7;
-
 constexpr const char* kClassNames[kNumOfClasses] = {"one",  "two",  "three", "four",
                                                     "five", "good", "ok"};
 
@@ -77,6 +75,23 @@ static void rgb24_to_nhwc_float_stride(const uint8_t* src, int W, int H, int str
   }
 }
 
+// Convert RGBA32 to NHWC float32 with stride support
+static void rgba32_to_nhwc_float_stride(const uint8_t* src, int W, int H, int stride, float* dst,
+                                        float scale) {
+  // stride: number of pixels per row (may be larger than W)
+  // NHWC layout: dst[(y * W + x) * 3 + c]
+  for (int y = 0; y < H; ++y) {
+    const uint8_t* row = src + static_cast<size_t>(y) * stride * 4;  // 4 bytes per pixel
+    for (int x = 0; x < W; ++x) {
+      const size_t idx = ((size_t) y * W + x) * 3;
+      dst[idx + 0] = static_cast<float>(row[4 * x + 0]) * scale;  // R
+      dst[idx + 1] = static_cast<float>(row[4 * x + 1]) * scale;  // G
+      dst[idx + 2] = static_cast<float>(row[4 * x + 2]) * scale;  // B
+      // row[4 * x + 3] is Alpha, ignored
+    }
+  }
+}
+
 // Convert RGB24 to NHWC float32
 static void rgb24_to_nhwc_float(const uint8_t* src, int W, int H, float* dst, float scale) {
   for (int y = 0; y < H; ++y) {
@@ -90,6 +105,228 @@ static void rgb24_to_nhwc_float(const uint8_t* src, int W, int H, float* dst, fl
   }
 }
 
+// Simple word-wrap using Hershey metrics.
+static std::vector<std::string> wrap_text(const std::string& text, int max_width_px, int font_face,
+                                          double font_scale, int thickness) {
+  if (max_width_px <= 0) {
+    // Split only on '\n'.
+    std::vector<std::string> lines;
+    size_t start = 0;
+    while (true) {
+      size_t p = text.find('\n', start);
+      if (p == std::string::npos) {
+        lines.push_back(text.substr(start));
+        break;
+      }
+      lines.push_back(text.substr(start, p - start));
+      start = p + 1;
+    }
+    if (lines.empty()) lines.push_back("");
+    return lines;
+  }
+
+  std::vector<std::string> lines;
+  std::string current;
+  std::string word;
+
+  auto Measure = [&](const std::string& s) -> int {
+    int base = 0;
+    return cv::getTextSize(s, font_face, font_scale, thickness, &base).width;
+  };
+
+  for (size_t i = 0; i <= text.size(); ++i) {
+    const char c = (i < text.size()) ? text[i] : ' ';
+    if (c == ' ' || c == '\n' || i == text.size()) {
+      if (!word.empty()) {
+        const std::string candidate = current.empty() ? word : (current + " " + word);
+        if (Measure(candidate) > max_width_px && !current.empty()) {
+          lines.push_back(current);
+          current = word;
+        } else {
+          current = candidate;
+        }
+        word.clear();
+      }
+      if (c == '\n') {
+        lines.push_back(current);
+        current.clear();
+      }
+    } else {
+      word.push_back(c);
+    }
+  }
+  if (!current.empty()) lines.push_back(current);
+  if (lines.empty()) lines.push_back("");
+  return lines;
+}
+
+static void render_text_to_raw_rgba(const std::string& text, cv::Mat* out_mat, int* out_w,
+                                    int* out_h, size_t* out_stride, int font_face,
+                                    double font_scale, int thickness, cv::Scalar color_rgba,
+                                    int padding, int line_spacing, int max_width_px,
+                                    bool add_shadow) {
+  if (out_mat == nullptr || out_w == nullptr || out_h == nullptr || out_stride == nullptr) {
+    return;
+  }
+
+  // 1) Wrap and measure.
+  const std::vector<std::string> lines =
+      wrap_text(text, max_width_px, font_face, font_scale, thickness);
+
+  int base = 0;
+  int max_w = 0;
+  int total_h = 0;
+  std::vector<cv::Size> sizes;
+  sizes.reserve(lines.size());
+
+  for (const std::string& ln : lines) {
+    const cv::Size sz = cv::getTextSize(ln, font_face, font_scale, thickness, &base);
+    sizes.push_back(sz);
+    if (sz.width > max_w) max_w = sz.width;
+    total_h += sz.height + line_spacing;
+  }
+  if (!lines.empty()) total_h -= line_spacing;
+
+  const int width = std::max(1, max_w + padding * 2);
+  const int height = std::max(1, total_h + padding * 2);
+
+  // 2) Alpha mask (8-bit) for coverage.
+  cv::Mat alpha(height, width, CV_8UC1, cv::Scalar(0));
+
+  if (add_shadow) {
+    const int kShadowDx = 1;
+    const int kShadowDy = 1;
+    const int kShadowAlpha = 200;
+    int y = padding;
+    for (size_t i = 0; i < lines.size(); ++i) {
+      const int yline = y + sizes[i].height;
+      cv::putText(alpha, lines[i], cv::Point(padding + kShadowDx, yline + kShadowDy), font_face,
+                  font_scale, kShadowAlpha, thickness + 2, cv::LINE_AA);
+      y += sizes[i].height + line_spacing;
+    }
+  }
+
+  {
+    int y = padding;
+    for (size_t i = 0; i < lines.size(); ++i) {
+      const int yline = y + sizes[i].height;
+      cv::putText(alpha, lines[i], cv::Point(padding, yline), font_face, font_scale, 255, thickness,
+                  cv::LINE_AA);
+      y += sizes[i].height + line_spacing;
+    }
+  }
+
+  // 3) Build RGBA in **RGBA** order.
+  // OpenCV cv::Scalar stores (val0, val1, val2, val3) = (R, G, B, A) as given.
+  cv::Mat r(height, width, CV_8UC1, cv::Scalar(static_cast<uint8_t>(color_rgba[2])));
+  cv::Mat g(height, width, CV_8UC1, cv::Scalar(static_cast<uint8_t>(color_rgba[1])));
+  cv::Mat b(height, width, CV_8UC1, cv::Scalar(static_cast<uint8_t>(color_rgba[0])));
+  cv::Mat a(height, width, CV_8UC1, cv::Scalar(0));
+
+  if (static_cast<int>(color_rgba[3]) == 255) {
+    alpha.copyTo(a);
+  } else {
+    cv::Mat scaled;
+    alpha.convertTo(scaled, CV_32F, color_rgba[3] / 255.0);
+    scaled.convertTo(a, CV_8U);
+  }
+
+  // Zero-out then mask-copy color where alpha > 0.
+  r.setTo(0);
+  g.setTo(0);
+  b.setTo(0);
+
+  cv::Mat tmp(height, width, CV_8UC1, cv::Scalar(static_cast<uint8_t>(color_rgba[2])));
+  tmp.copyTo(r, alpha);
+  tmp.setTo(static_cast<uint8_t>(color_rgba[1]));
+  tmp.copyTo(g, alpha);
+  tmp.setTo(static_cast<uint8_t>(color_rgba[0]));
+  tmp.copyTo(b, alpha);
+
+  std::vector<cv::Mat> channels;
+  channels.reserve(4);
+  channels.push_back(r);
+  channels.push_back(g);
+  channels.push_back(b);
+  channels.push_back(a);
+
+  cv::merge(channels, *out_mat);  // CV_8UC4, RGBA order.
+
+  // 4) Ensure contiguous and export raw bytes.
+  if (!out_mat->isContinuous()) {
+    *out_mat = out_mat->clone();
+  }
+  *out_stride = static_cast<size_t>(out_mat->step[0]);
+  *out_w = out_mat->cols;
+  *out_h = out_mat->rows;
+}
+
+OsdText::OsdText(const std::string& text) : text_(text), w_(0), h_(0), stride_(0) {
+  // Constants for text rendering
+  const int kFontFace = cv::FONT_HERSHEY_SIMPLEX;
+  const double kFontScale = 1.0;
+  const int kThickness = 2;
+  const cv::Scalar kColorRgba(255, 255, 255, 255);  // White, opaque
+  const int kPadding = 12;
+  const int kLineSpacing = 6;
+  const int kMaxWidthPx = 480;
+
+  memset(&config_, 0, sizeof(im_osd_t));
+  memset(&rga_buffer_, 0, sizeof(rga_buffer_t));
+
+  // Calculate RGBA image size and render text to RGBA buffer
+  render_text_to_raw_rgba(text_, &rgba_, &w_, &h_, &stride_, kFontFace, kFontScale, kThickness,
+                          kColorRgba, kPadding, kLineSpacing, kMaxWidthPx, false);
+
+  // Configure OSD settings
+  config_.block_parm.width_mode = IM_OSD_BLOCK_MODE_NORMAL;
+  config_.block_parm.width = w_;
+  config_.block_parm.block_count = 1;
+  config_.block_parm.background_config = IM_OSD_BACKGROUND_DEFAULT_BRIGHT;
+  config_.block_parm.direction = IM_OSD_MODE_HORIZONTAL;
+  config_.block_parm.color_mode = IM_OSD_COLOR_PIXEL;
+
+  config_.invert_config.invert_channel = IM_OSD_INVERT_CHANNEL_COLOR;
+  config_.invert_config.flags_mode = IM_OSD_FLAGS_EXTERNAL;
+  config_.invert_config.invert_flags = 0x000000000000002a;
+  config_.invert_config.flags_index = 1;
+  config_.invert_config.threash = 40;
+  config_.invert_config.invert_mode = IM_OSD_INVERT_USE_SWAP;
+
+  // Allocate DMA buffer for RGA
+  char* vir_addr = nullptr;
+  auto buf_size = static_cast<size_t>(stride_) * static_cast<size_t>(h_);
+  int fd = -1;
+  int ret = dma_buf_alloc(DMA_HEAP_DMA32_UNCACHED_PATH, buf_size, &fd, (void**) &vir_addr);
+  if (ret != 0) {
+    assert(false && "OsdText::OsdText: alloc dma32_heap buffer failed");
+  }
+
+  // Copy the rendered RGBA data to the allocated buffer
+  memcpy(vir_addr, rgba_.data, buf_size);
+
+  // Import to RGA buffer
+  auto handle = importbuffer_fd(fd, buf_size);
+  if (handle == 0) {
+    assert(false && "OsdText::OsdText: importbuffer_fd failed");
+  }
+
+  rga_buffer_ = wrapbuffer_handle(handle, w_, h_, RK_FORMAT_RGBA_8888);
+  rga_buffer_.fd = fd;  // Keep the fd for later free
+}
+
+OsdText::~OsdText() {
+  if (rga_buffer_.handle > 0) {
+    releasebuffer_handle(rga_buffer_.handle);
+    rga_buffer_.handle = 0;
+  }
+  if (rga_buffer_.fd > 0) {
+    auto buf_size = static_cast<size_t>(stride_) * static_cast<size_t>(h_);
+    dma_buf_free(buf_size, &rga_buffer_.fd, rga_buffer_.vir_addr);
+    rga_buffer_.fd = -1;
+  }
+}
+
 DetSource::DetSource(std::string_view id)
     : id_(id),
       running_(false),
@@ -97,8 +334,8 @@ DetSource::DetSource(std::string_view id)
       rknn_ctx_(0),
       last_success_fd_(-1),
       ready_(false),
-      frame_width_(0),
-      frame_height_(0) {
+      frame_width_(1920),
+      frame_height_(1080) {
   LOGI(TAG, "Create DetSource with id: %s", id_.c_str());
   auto ret = Init();
   assert(ret == 0 && "DetSource Init failed");
@@ -217,10 +454,15 @@ int DetSource::Init() {
   // create ring buffer
   ring_buffer_ = std::make_unique<RingBuffer<VideoFrameSlot> >(kDefaultRingBufferSize);
   // create rga buffer pools
-  rgb_buffer_pool_ = std::make_unique<RgaBufferPool>(kMaxDecodedFrameBufferCount, RK_FORMAT_RGB_888,
-                                                     kInputWidth, kInputHeight);
+  rgb_buffer_pool_ = std::make_unique<RgaBufferPool>(
+      kMaxDecodedFrameBufferCount, RK_FORMAT_RGBA_8888, frame_width_, frame_height_);
+  nv12_buffer_pool_ = std::make_unique<RgaBufferPool>(
+      kMaxDecodedFrameBufferCount, RK_FORMAT_YCbCr_420_SP, frame_width_, frame_height_);
   scale_buffer_pool_ = std::make_unique<RgaBufferPool>(
-      kMaxDecodedFrameBufferCount, RK_FORMAT_YCbCr_420_SP, kInputWidth, kInputHeight);
+      kMaxDecodedFrameBufferCount, RK_FORMAT_RGBA_8888, kInputWidth, kInputHeight);
+
+  // create osd texts
+  CreateOsdTexts();
 
   return 0;
 }
@@ -244,7 +486,24 @@ void DetSource::DeInit() {
   // Deinitialize RKNN context
   rknn_destroy(rknn_ctx_);
 
+  // Free OSD texts
+  DestroyOsdTexts();
+
   LOGI(TAG, "DetSource deinitialized successfully");
+}
+
+void DetSource::CreateOsdTexts() {
+  for (size_t i = 0; i < kNumOfClasses; ++i) {
+    auto osd_text = std::make_unique<OsdText>(kClassNames[i]);
+    osd_texts_.emplace_back(std::move(osd_text));
+  }
+}
+
+void DetSource::DestroyOsdTexts() {
+  for (auto& osd_text : osd_texts_) {
+    osd_text.reset();
+  }
+  osd_texts_.clear();
 }
 
 bool DetSource::Start() {
@@ -371,7 +630,39 @@ rga_buffer_t* DetSource::GetImportedRgaBuffer() {
   return rga_buffers_.at(last_success_fd_).get();
 }
 
-rga_buffer_t* DetSource::ScaleConvert(rga_buffer_t* src) {
+rga_buffer_t* DetSource::Convert2RGBA(rga_buffer_t* src) {
+  rga_buffer_t* dst = rgb_buffer_pool_->Acquire();
+  if (dst == nullptr) {
+    LOGE(TAG, "failed to acquire rga buffer");
+    return nullptr;
+  }
+
+  auto ret = imcvtcolor(*src, *dst, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGBA_8888);
+  if (IM_STATUS_SUCCESS != ret) {
+    LOGE(TAG, "convert to rgb888 failed, %s", imStrError(ret));
+    return nullptr;
+  }
+
+  return dst;
+}
+
+rga_buffer_t* DetSource::Convert2NV12(rga_buffer_t* src) {
+  rga_buffer_t* dst = nv12_buffer_pool_->Acquire();
+  if (dst == nullptr) {
+    LOGE(TAG, "failed to acquire rga buffer");
+    return nullptr;
+  }
+
+  auto ret = imcvtcolor(*src, *dst, RK_FORMAT_RGBA_8888, RK_FORMAT_YCbCr_420_SP);
+  if (IM_STATUS_SUCCESS != ret) {
+    LOGE(TAG, "convert to rgb888 failed, %s", imStrError(ret));
+    return nullptr;
+  }
+
+  return dst;
+}
+
+rga_buffer_t* DetSource::Letterbox(rga_buffer_t* src) {
   auto width = (float) src->width * letter_box_.scale;
   auto height = (float) src->height * letter_box_.scale;
 
@@ -395,19 +686,7 @@ rga_buffer_t* DetSource::ScaleConvert(rga_buffer_t* src) {
     return nullptr;
   }
 
-  rga_buffer_t* dst = rgb_buffer_pool_->Acquire();
-  if (dst == nullptr) {
-    LOGE(TAG, "failed to acquire rga buffer");
-    return nullptr;
-  }
-
-  ret = imcvtcolor(*scale_dst, *dst, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888);
-  if (IM_STATUS_SUCCESS != ret) {
-    LOGE(TAG, "convert to rgb888 failed, %s", imStrError(ret));
-    return nullptr;
-  }
-
-  return dst;
+  return scale_dst;
 }
 
 void DetSource::MainLoop() {
@@ -419,7 +698,7 @@ void DetSource::MainLoop() {
       continue;
     }
 
-    auto begin = std::chrono::steady_clock::now();
+    // auto begin = std::chrono::steady_clock::now();
 
     auto src_buffer = GetImportedRgaBuffer();
     if (src_buffer == nullptr) {
@@ -428,9 +707,16 @@ void DetSource::MainLoop() {
       continue;
     }
 
-    // Letterbox & convert to RGB
-    rga_buffer_t* rgb_buffer = ScaleConvert(src_buffer);
+    // Convert to RGBA32
+    rga_buffer_t* rgb_buffer = Convert2RGBA(src_buffer);
     if (rgb_buffer == nullptr) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(kDefaultWaitingTimeInMs));
+      continue;
+    }
+
+    // Letterbox
+    rga_buffer_t* scaled_buffer = Letterbox(rgb_buffer);
+    if (scaled_buffer == nullptr) {
       std::this_thread::sleep_for(std::chrono::milliseconds(kDefaultWaitingTimeInMs));
       continue;
     }
@@ -442,8 +728,9 @@ void DetSource::MainLoop() {
       return;
     }
     // Convert RGB24 to NHWC float32
-    rgb24_to_nhwc_float_stride((uint8_t*) rgb_buffer->vir_addr, kInputWidth, kInputHeight,
-                               (int) rgb_buffer->wstride, (float*) mem->virt_addr, 1.0f / 255.0f);
+    rgba32_to_nhwc_float_stride((uint8_t*) scaled_buffer->vir_addr, kInputWidth, kInputHeight,
+                                (int) scaled_buffer->wstride, (float*) mem->virt_addr,
+                                1.0f / 255.0f);
 
     // Inference
     auto ret = rknn_run(rknn_ctx_, nullptr);
@@ -460,17 +747,20 @@ void DetSource::MainLoop() {
     }
 
     // Draw OSD
-    // DrawOsd(src_buffer, detected_objects);
+    DrawOsd(rgb_buffer, detected_objects);
+
+    // Convert back to NV12
+    rga_buffer_t* nv12_buffer = Convert2NV12(rgb_buffer);
 
     {
       // Callbacks to sinks
       std::lock_guard<std::mutex> lock(sink_mutex_);
-      current_frame_ = {(RK_U32) src_buffer->width,
-                        (RK_U32) src_buffer->height,
-                        (RK_U32) src_buffer->wstride,
-                        (RK_U32) src_buffer->hstride,
+      current_frame_ = {(RK_U32) nv12_buffer->width,
+                        (RK_U32) nv12_buffer->height,
+                        (RK_U32) nv12_buffer->wstride,
+                        (RK_U32) nv12_buffer->hstride,
                         MPP_FMT_YUV420SP,
-                        src_buffer->fd,
+                        nv12_buffer->fd,
                         false,
                         false};
       for (auto* sink : sinks_) {
@@ -478,9 +768,9 @@ void DetSource::MainLoop() {
       }
     }
 
-    auto end = std::chrono::steady_clock::now();
-    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
-    LOGD(TAG, "Processed one frame in %lu ms", (long long) elapsed_ms);
+    // auto end = std::chrono::steady_clock::now();
+    // auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
+    // LOGD(TAG, "Processed one frame in %llu ms", elapsed_ms);
   }
 
   LOGD(TAG, "DetSource main loop exited");
@@ -612,6 +902,8 @@ void DetSource::DrawOsd(rga_buffer_t* buffer, const std::vector<DetectedObject>&
   std::vector<im_rect> rects;
   rects.reserve(objects.size());
 
+  im_job_handle_t job = imbeginJob();
+
   int ret = 0;
   for (const auto& obj : objects) {
     int x, y, w, h;
@@ -619,20 +911,41 @@ void DetSource::DrawOsd(rga_buffer_t* buffer, const std::vector<DetectedObject>&
     y = obj.box.y & (~1);       // y must be even
     w = obj.box.width & (~1);   // w must be even
     h = obj.box.height & (~1);  // h must be even
+
+    // Draw box
     im_rect rect{x, y, w, h};
     ret = imcheck({}, *buffer, {}, rect, IM_COLOR_FILL);
-
     if (IM_STATUS_NOERROR != ret) {
       LOGE(TAG, "draw rectangle check failed, %s", imStrError(ret));
       continue;
     }
+    ret = imrectangleTask(job, *buffer, rect, 0xff00ff00, 2);
+    if (IM_STATUS_SUCCESS != ret) {
+      LOGE(TAG, "apply draw rectangle task failed, %s", imStrError(ret));
+      continue;
+    }
 
-    rects.emplace_back(rect);
+    // Draw label
+    const auto& osd = osd_texts_[obj.label];
+    int osd_y = std::max(0, y - osd->GetHeight() - 2);
+    im_rect osd_rect = {x, osd_y, osd->GetWidth(), osd->GetHeight()};
+    auto& osd_img = osd->GetRgaBuffer();
+    ret = imcheck(osd_img, *buffer, {}, osd_rect);
+    if (IM_STATUS_NOERROR != ret) {
+      LOGE(TAG, "draw label check failed, %s", imStrError(ret));
+      continue;
+    }
+    ret = imosdTask(job, osd_img, *buffer, osd_rect, osd->GetOsdConfigPtr());
+    if (IM_STATUS_SUCCESS != ret) {
+      LOGE(TAG, "apply draw label task failed, %s", imStrError(ret));
+      continue;
+    }
   }
 
-  ret = imrectangleArray(*buffer, rects.data(), (int) rects.size(), 0xff00ff00, 2);
+  ret = imendJob(job);
   if (IM_STATUS_SUCCESS != ret) {
-    LOGE(TAG, "draw rectangle failed, %s", imStrError(ret));
+    LOGE(TAG, "imendJob failed, %s", imStrError(ret));
+    imcancelJob(job);
   }
 }
 

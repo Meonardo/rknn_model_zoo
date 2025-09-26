@@ -7,11 +7,10 @@
 
 #include <vector>
 
-#include "im2d.h"
-#include "RgaUtils.h"
-
-#include "DmaAlloc.h"
 #include "../VideoSink.h"
+#include "DmaAlloc.h"
+#include "RgaUtils.h"
+#include "im2d.h"
 
 struct ExternalBufferGroup;
 
@@ -25,7 +24,7 @@ struct ExtMppBufferAllocator {
   void InitBuffer(int idx, rga_buffer_t* buffer) const;
 
  private:
-  ExternalBufferGroup *buffer_group_;
+  ExternalBufferGroup* buffer_group_;
 };
 
 enum BufferType {
@@ -36,33 +35,31 @@ enum BufferType {
 
 class RgaBufferPool {
  public:
-  RgaBufferPool(size_t pool_size,
-				RgaSURF_FORMAT format,
-				int w = kBaseVideoWidth,
-				int h = kBaseVideoHeight,
+  RgaBufferPool(size_t pool_size, RgaSURF_FORMAT format, int w = kBaseVideoWidth,
+                int h = kBaseVideoHeight,
 #if USE_VIRTUAL_ADDRESS
-	  BufferType buf_type = kBufferTypeCpu);
+                BufferType buf_type = kBufferTypeCpu);
 #elif USE_MPP_BUFFER
-				BufferType buf_type = kBufferTypeMpp);
+                BufferType buf_type = kBufferTypeDma);
 #else
-  BufferType buf_type = kBufferTypeDma);
+                BufferType buf_type = kBufferTypeDma);
 #endif
 
   ~RgaBufferPool();
 
   // copy
-  RgaBufferPool(const RgaBufferPool &);
-  RgaBufferPool &operator=(const RgaBufferPool &);
+  RgaBufferPool(const RgaBufferPool&);
+  RgaBufferPool& operator=(const RgaBufferPool&);
 
-  rga_buffer_t *Acquire();
-  void Recycle(rga_buffer_t *buffer);
+  rga_buffer_t* Acquire();
+  void Recycle(rga_buffer_t* buffer);
 
   void Refresh();
 
  private:
   size_t pool_size_;
   BufferType buf_type_;
-  ExternalBufferGroup *buffer_group_;
+  ExternalBufferGroup* buffer_group_;
 
   int width_;
   int height_;
@@ -73,7 +70,7 @@ class RgaBufferPool {
   size_t current_index_;
   std::vector<std::unique_ptr<rga_buffer_t>> buffers_;
 
-  bool ImportRgaBuffer(rga_buffer_t *buffer);
+  bool ImportRgaBuffer(rga_buffer_t* buffer);
 };
 
-#endif //GSTREAMERANDROID_MEDIACORE_SRC_MAIN_CPP_RGABUFFERPOOL_H_
+#endif  // GSTREAMERANDROID_MEDIACORE_SRC_MAIN_CPP_RGABUFFERPOOL_H_
