@@ -19,11 +19,11 @@ constexpr uint32_t kInputHeight = 640;
 constexpr uint32_t kMaxValidBBoxes = 32;
 constexpr size_t kInputTensorSize = 1 * kInputHeight * kInputWidth * 3;
 constexpr size_t kInputTensorSizeInBytes = kInputTensorSize * sizeof(float);
-constexpr float kDetModelClassScoreThreshold = 0.85f;  // Score threshold for valid detections
+constexpr float kDetModelClassScoreThreshold = 0.75f;  // Score threshold for valid detections
 constexpr float kDetModelNmsThreshold = 0.4f;          // Non-Maximum Suppression threshold
 
-constexpr const char* kClassNames[kNumOfClasses] = {"one",  "two",  "three", "four",
-                                                    "five", "good", "ok"};
+constexpr const char* kClassNames[kNumOfClasses] = {"One",  "Two",  "Three", "Four",
+                                                    "Five", "Good", "OK"};
 
 static void dump_tensor_attr(rknn_tensor_attr* attr) {
   LOGD(TAG,
@@ -935,7 +935,7 @@ void DetSource::DrawOsd(rga_buffer_t* buffer, const std::vector<DetectedObject>&
       LOGE(TAG, "draw label check failed, %s", imStrError(ret));
       continue;
     }
-    ret = imosdTask(job, osd_img, *buffer, osd_rect, osd->GetOsdConfigPtr());
+    ret = improcessTask(job, osd_img, *buffer, {}, {}, osd_rect, {}, nullptr, IM_SYNC);
     if (IM_STATUS_SUCCESS != ret) {
       LOGE(TAG, "apply draw label task failed, %s", imStrError(ret));
       continue;
