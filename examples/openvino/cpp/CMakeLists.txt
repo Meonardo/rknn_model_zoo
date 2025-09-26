@@ -71,7 +71,12 @@ else ()
     if (DET_TYPE STREQUAL "ACTION")
         list(APPEND SRC_FILES src/ActionDetection.cpp)
     else ()
-        list(APPEND SRC_FILES src/SignDetection.cpp)
+        list(
+                APPEND 
+                SRC_FILES 
+                src/SignDetection.cpp
+                src/DetSource.cpp
+        )
     endif ()
 
     add_executable(

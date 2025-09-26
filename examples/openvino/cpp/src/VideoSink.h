@@ -104,7 +104,7 @@ struct EncodedVideoInfo {
   std::string stream_format; // byte-stream, avc, annexb
   std::string profile_level_id; // h264: 4D0029, h265: 018028
   std::string alignment; // au, nal
-  int pixel_format; // 0: yuv420sp(nv12), 1: RGBA
+  int pixel_format; // 0: yuv420sp(nv12), 1: RGBA, 2: RGB
 
   EncodedVideoInfo();
   ~EncodedVideoInfo() = default;

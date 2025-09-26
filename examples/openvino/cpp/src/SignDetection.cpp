@@ -1,28 +1,13 @@
-#include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
-#include <numeric>
-#include <string>
-#include <thread>
-#include <unordered_map>
-#include <vector>
-
-// OpenCV
-#include <opencv2/core.hpp>
-#include <opencv2/highgui.hpp>
 
 #include "Common.h"
 #include "OnvifCore.h"
 #include "OnvifSink.h"
 #include "RtspSource.h"
-#include "rknn_api.h"
-
-#define MODEL_PATH "/data/local/tmp/lldb-standalone/hand_sign_v8n.rknn"
+#include "DetSource.h"
 
 #define TAG "App"
 
@@ -32,17 +17,28 @@ struct RtspStream {
   std::unique_ptr<rtsp::OnvifSink> onvif_sink = nullptr;
   // Sources
   std::unique_ptr<rtsp::RtspSource> video_source = nullptr;
+  std::unique_ptr<det::DetSource> det_source = nullptr;
 
   void Start() {
-    video_source->AddVideoSink(onvif_sink.get());
+    // Start video source
     video_source->Start();
+    // Start detection
+    det_source->Start();
+    // Link video source to detection source
+    video_source->AddVideoSink(det_source.get());
+    // Link detection source to ONVIF sink
+    det_source->AddVideoSink(onvif_sink.get());
   }
 
   void Stop() {
     video_source->Stop();
-    video_source->RemoveVideoSink(onvif_sink.get());
+    video_source->RemoveVideoSink(det_source.get());
+    det_source->Stop();
+    det_source->RemoveVideoSink(onvif_sink.get());
+
     onvif_sink.reset();
     video_source.reset();
+    det_source.reset();
   }
 };
 
@@ -87,6 +83,9 @@ static void create_rtsp_stream(std::string_view id, std::string_view src_url,
 
   // create RTSP source
   stream->video_source = std::make_unique<rtsp::RtspSource>(id, src_url);
+
+  // create detection source and link to video source
+  stream->det_source = std::make_unique<det::DetSource>(id);
 
   // start streaming
   stream->Start();
