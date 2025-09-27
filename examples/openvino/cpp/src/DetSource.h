@@ -120,6 +120,8 @@ class DetSource : public RawVideoSink, public VideoSource {
   int last_success_fd_;
   std::atomic<bool> ready_;
   LetterBox letter_box_;
+  uint32_t model_input_width_;
+  uint32_t model_input_height_;
   uint32_t frame_width_;
   uint32_t frame_height_;
   std::vector<std::unique_ptr<OsdText>> osd_texts_;

@@ -8,17 +8,13 @@
 
 #include "Common.h"
 
-#define MODEL_PATH "/data/local/tmp/lldb-standalone/hand_sign_v8n.rknn"
+#define MODEL_PATH "/data/local/tmp/lldb-standalone/hand_sign_v8n_f32.rknn"
 
 #define TAG "DetSource"
 
 namespace det {
 
-constexpr uint32_t kInputWidth = 640;
-constexpr uint32_t kInputHeight = 640;
 constexpr uint32_t kMaxValidBBoxes = 32;
-constexpr size_t kInputTensorSize = 1 * kInputHeight * kInputWidth * 3;
-constexpr size_t kInputTensorSizeInBytes = kInputTensorSize * sizeof(float);
 constexpr float kDetModelClassScoreThreshold = 0.75f;  // Score threshold for valid detections
 constexpr float kDetModelNmsThreshold = 0.4f;          // Non-Maximum Suppression threshold
 
@@ -87,6 +83,22 @@ static void rgba32_to_nhwc_float_stride(const uint8_t* src, int W, int H, int st
       dst[idx + 0] = static_cast<float>(row[4 * x + 0]) * scale;  // R
       dst[idx + 1] = static_cast<float>(row[4 * x + 1]) * scale;  // G
       dst[idx + 2] = static_cast<float>(row[4 * x + 2]) * scale;  // B
+      // row[4 * x + 3] is Alpha, ignored
+    }
+  }
+}
+
+// Convert RGBA32 to NHWC float32 with stride support
+static void rgba32_to_nhwc_i8_stride(const uint8_t* src, int W, int H, int stride, int8_t* dst) {
+  // stride: number of pixels per row (may be larger than W)
+  // NHWC layout: dst[(y * W + x) * 3 + c]
+  for (int y = 0; y < H; ++y) {
+    const uint8_t* row = src + static_cast<size_t>(y) * stride * 4;  // 4 bytes per pixel
+    for (int x = 0; x < W; ++x) {
+      const size_t idx = ((size_t) y * W + x) * 3;
+      dst[idx + 0] = static_cast<int8_t>(row[4 * x + 0] - 128);  // R
+      dst[idx + 1] = static_cast<int8_t>(row[4 * x + 1] - 128);  // G
+      dst[idx + 2] = static_cast<int8_t>(row[4 * x + 2] - 128);  // B
       // row[4 * x + 3] is Alpha, ignored
     }
   }
@@ -334,6 +346,8 @@ DetSource::DetSource(std::string_view id)
       rknn_ctx_(0),
       last_success_fd_(-1),
       ready_(false),
+      model_input_width_(640),
+      model_input_height_(640),
       frame_width_(1920),
       frame_height_(1080) {
   LOGI(TAG, "Create DetSource with id: %s", id_.c_str());
@@ -376,7 +390,7 @@ int DetSource::Init() {
   LOGI(TAG, "rknn_query input num: %d, output num: %d", io_num_.n_input, io_num_.n_output);
 
   // Query input tensor shape
-  input_attrs_.reserve(io_num_.n_input);
+  input_attrs_.resize(io_num_.n_input);
   for (int i = 0; i < io_num_.n_input; i++) {
     input_attrs_[i].index = i;  // Set index for input tensor
     ret = rknn_query(rknn_ctx_, RKNN_QUERY_INPUT_ATTR, &input_attrs_[i], sizeof(rknn_tensor_attr));
@@ -389,7 +403,7 @@ int DetSource::Init() {
   }
 
   // Query output tensor shape
-  output_attrs_.reserve(io_num_.n_output);
+  output_attrs_.resize(io_num_.n_output);
   for (int i = 0; i < io_num_.n_output; i++) {
     output_attrs_[i].index = i;  // Set index for output tensor
     ret =
@@ -405,13 +419,17 @@ int DetSource::Init() {
   // Create input tensors
   input_mems_.reserve(io_num_.n_input);
   for (int i = 0; i < io_num_.n_input; i++) {
-    input_attrs_[i].fmt = RKNN_TENSOR_NHWC;      // Set format to NHWC
-    input_attrs_[i].type = RKNN_TENSOR_FLOAT32;  // float32, not quantized
-    input_attrs_[i].size = kInputTensorSizeInBytes;
-    input_attrs_[i].size_with_stride = kInputTensorSizeInBytes;
-
     // Create memory for this tensor
-    auto* mem = rknn_create_mem(rknn_ctx_, kInputTensorSizeInBytes);
+    rknn_tensor_mem* mem = nullptr;
+    if (input_attrs_[i].type == RKNN_TENSOR_FLOAT16) {
+      input_attrs_[i].type = RKNN_TENSOR_FLOAT32;           // change to float32
+      auto size = input_attrs_[i].n_elems * sizeof(float);  // float32
+      input_attrs_[i].size = size;
+      input_attrs_[i].size_with_stride = size;
+      mem = rknn_create_mem(rknn_ctx_, size);
+    } else {
+      mem = rknn_create_mem(rknn_ctx_, input_attrs_[i].size_with_stride);
+    }
     if (!mem) {
       LOGE(TAG, "create input mem fail");
       return -1;
@@ -429,14 +447,17 @@ int DetSource::Init() {
   // Create output tensors: [1, 11, 8400]
   output_mems_.reserve(io_num_.n_output);
   for (int i = 0; i < io_num_.n_output; i++) {
-    output_attrs_[i].type = RKNN_TENSOR_FLOAT32;  // float32, not quantized
-
-    // Calculate output tensor size
-    output_attrs_[i].size = output_attrs_[i].dims[1] * output_attrs_[i].dims[2] * sizeof(float);
-    output_attrs_[i].size_with_stride = output_attrs_[i].size;
-
     // Create memory for this tensor
-    auto* mem = rknn_create_mem(rknn_ctx_, output_attrs_[i].size);
+    rknn_tensor_mem* mem = nullptr;
+    if (output_attrs_[i].type == RKNN_TENSOR_FLOAT16) {
+      output_attrs_[i].type = RKNN_TENSOR_FLOAT32;           // change to float32
+      auto size = output_attrs_[i].n_elems * sizeof(float);  // float32
+      output_attrs_[i].size = size;
+      output_attrs_[i].size_with_stride = size;
+      mem = rknn_create_mem(rknn_ctx_, size);
+    } else {
+      mem = rknn_create_mem(rknn_ctx_, output_attrs_[i].size_with_stride);
+    }
     if (!mem) {
       LOGE(TAG, "create output mem fail");
       return -1;
@@ -451,15 +472,22 @@ int DetSource::Init() {
     }
   }
 
+  // Update model input width and height
+  if (input_attrs_.size() > 0) {  // rknn use NHWC as default
+    model_input_width_ = static_cast<uint32_t>(input_attrs_[0].dims[2]);
+    model_input_height_ = static_cast<uint32_t>(input_attrs_[0].dims[1]);
+    LOGI(TAG, "Model input width: %u, height: %u", model_input_width_, model_input_height_);
+  }
+
   // create ring buffer
   ring_buffer_ = std::make_unique<RingBuffer<VideoFrameSlot> >(kDefaultRingBufferSize);
   // create rga buffer pools
-  rgb_buffer_pool_ = std::make_unique<RgaBufferPool>(
-      kMaxDecodedFrameBufferCount, RK_FORMAT_RGBA_8888, frame_width_, frame_height_);
+  rgb_buffer_pool_ = std::make_unique<RgaBufferPool>(kMaxDecodedFrameBufferCount, RK_FORMAT_RGB_888,
+                                                     frame_width_, frame_height_);
   nv12_buffer_pool_ = std::make_unique<RgaBufferPool>(
       kMaxDecodedFrameBufferCount, RK_FORMAT_YCbCr_420_SP, frame_width_, frame_height_);
   scale_buffer_pool_ = std::make_unique<RgaBufferPool>(
-      kMaxDecodedFrameBufferCount, RK_FORMAT_RGBA_8888, kInputWidth, kInputHeight);
+      kMaxDecodedFrameBufferCount, RK_FORMAT_RGB_888, model_input_width_, model_input_height_);
 
   // create osd texts
   CreateOsdTexts();
@@ -637,7 +665,7 @@ rga_buffer_t* DetSource::Convert2RGBA(rga_buffer_t* src) {
     return nullptr;
   }
 
-  auto ret = imcvtcolor(*src, *dst, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGBA_8888);
+  auto ret = imcvtcolor(*src, *dst, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888);
   if (IM_STATUS_SUCCESS != ret) {
     LOGE(TAG, "convert to rgb888 failed, %s", imStrError(ret));
     return nullptr;
@@ -653,7 +681,7 @@ rga_buffer_t* DetSource::Convert2NV12(rga_buffer_t* src) {
     return nullptr;
   }
 
-  auto ret = imcvtcolor(*src, *dst, RK_FORMAT_RGBA_8888, RK_FORMAT_YCbCr_420_SP);
+  auto ret = imcvtcolor(*src, *dst, RK_FORMAT_RGB_888, RK_FORMAT_YCbCr_420_SP);
   if (IM_STATUS_SUCCESS != ret) {
     LOGE(TAG, "convert to rgb888 failed, %s", imStrError(ret));
     return nullptr;
@@ -728,9 +756,12 @@ void DetSource::MainLoop() {
       return;
     }
     // Convert RGB24 to NHWC float32
-    rgba32_to_nhwc_float_stride((uint8_t*) scaled_buffer->vir_addr, kInputWidth, kInputHeight,
-                                (int) scaled_buffer->wstride, (float*) mem->virt_addr,
-                                1.0f / 255.0f);
+    rgb24_to_nhwc_float_stride((uint8_t*) scaled_buffer->vir_addr, model_input_width_,
+                               model_input_height_, (int) scaled_buffer->wstride,
+                               (float*) mem->virt_addr, 1.0f);
+    // rgba32_to_nhwc_i8_stride((uint8_t*) scaled_buffer->vir_addr, model_input_width_,
+    //                          model_input_height_, (int) scaled_buffer->wstride,
+    //                          (int8_t*) mem->virt_addr);
 
     // Inference
     auto ret = rknn_run(rknn_ctx_, nullptr);
@@ -780,16 +811,16 @@ void DetSource::CalculateLetterBox() {
   auto original_width = (float) frame_width_;
   auto original_height = (float) frame_height_;
   // calculate the scale
-  float scale =
-      std::min((float) kInputWidth / original_width, (float) kInputWidth / original_height);
+  float scale = std::min((float) model_input_width_ / original_width,
+                         (float) model_input_height_ / original_height);
 
   // calculate the scaled image dimensions
   float scaled_width = original_width * scale;
   float scaled_height = original_height * scale;
 
   // calculate padding
-  int x_pad = static_cast<int>(((float) kInputWidth - scaled_width) / 2);
-  int y_pad = static_cast<int>(((float) kInputWidth - scaled_height) / 2);
+  int x_pad = static_cast<int>(((float) model_input_width_ - scaled_width) / 2);
+  int y_pad = static_cast<int>(((float) model_input_height_ - scaled_height) / 2);
 
   letter_box_.x_pad = x_pad;
   letter_box_.y_pad = y_pad;
