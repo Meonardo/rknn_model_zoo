@@ -152,7 +152,7 @@ class DetSource : public RawVideoSink, public VideoSource {
   int Processi8(int8_t* box_tensor, int32_t box_zp, float box_scale, int8_t* score_tensor,
                 int32_t score_zp, float score_scale, int8_t* score_sum_tensor, int32_t score_sum_zp,
                 float score_sum_scale, uint32_t grid_h, uint32_t grid_w, uint32_t stride,
-                uint32_t dfl_len, std::vector<float>& boxes, std::vector<float>& scores,
+                uint32_t dfl_len, std::vector<cv::Rect>& boxes, std::vector<float>& scores,
                 std::vector<int>& class_id);
 #else
   std::vector<DetectedObject> PostProcess();

@@ -112,84 +112,6 @@ static void compute_dfl(float* tensor, int dfl_len, float* box) {
   }
 }
 
-static float calculate_overlap(float xmin0, float ymin0, float xmax0, float ymax0, float xmin1,
-                               float ymin1, float xmax1, float ymax1) {
-  auto w = fmax(0.f, fmin(xmax0, xmax1) - fmax(xmin0, xmin1) + 1.0);
-  auto h = fmax(0.f, fmin(ymax0, ymax1) - fmax(ymin0, ymin1) + 1.0);
-  auto i = w * h;
-  auto u = (xmax0 - xmin0 + 1.0) * (ymax0 - ymin0 + 1.0) +
-           (xmax1 - xmin1 + 1.0) * (ymax1 - ymin1 + 1.0) - i;
-  return u <= 0.f ? 0.f : (float) (i / u);
-}
-
-inline static int clamp(float val, int min, int max) {
-  return val > min ? (val < max ? val : max) : min;
-}
-
-static int nms(int valid_count, std::vector<float>& output_locations, std::vector<int> class_ids,
-               std::vector<int>& order, int filter_id, float threshold) {
-  for (int i = 0; i < valid_count; ++i) {
-    int n = order[i];
-    if (n == -1 || class_ids[n] != filter_id) {
-      continue;
-    }
-
-    for (int j = i + 1; j < valid_count; ++j) {
-      int m = order[j];
-      if (m == -1 || class_ids[m] != filter_id) {
-        continue;
-      }
-
-      float xmin0 = output_locations[n * 4 + 0];
-      float ymin0 = output_locations[n * 4 + 1];
-      float xmax0 = output_locations[n * 4 + 0] + output_locations[n * 4 + 2];
-      float ymax0 = output_locations[n * 4 + 1] + output_locations[n * 4 + 3];
-
-      float xmin1 = output_locations[m * 4 + 0];
-      float ymin1 = output_locations[m * 4 + 1];
-      float xmax1 = output_locations[m * 4 + 0] + output_locations[m * 4 + 2];
-      float ymax1 = output_locations[m * 4 + 1] + output_locations[m * 4 + 3];
-
-      // calculate IoU (Intersection over Union)
-      float iou = calculate_overlap(xmin0, ymin0, xmax0, ymax0, xmin1, ymin1, xmax1, ymax1);
-
-      if (iou > threshold) {
-        order[j] = -1;
-      }
-    }
-  }
-  return 0;
-}
-
-static int quick_sort_indices_inverse(std::vector<float>& input, int left, int right,
-                                      std::vector<int>& indices) {
-  float key;
-  int key_index;
-  int low = left;
-  int high = right;
-  if (left < right) {
-    key_index = indices[left];
-    key = input[left];
-    while (low < high) {
-      while (low < high && input[high] <= key) {
-        high--;
-      }
-      input[low] = input[high];
-      indices[low] = indices[high];
-      while (low < high && input[low] >= key) {
-        low++;
-      }
-      input[high] = input[low];
-      indices[high] = indices[low];
-    }
-    input[low] = key;
-    indices[low] = key_index;
-    quick_sort_indices_inverse(input, left, low - 1, indices);
-    quick_sort_indices_inverse(input, low + 1, right, indices);
-  }
-  return low;
-}
-
 #else
 // Convert RGB24 to NHWC float32 with stride support
 static void rgb24_to_nhwc_float_stride(const uint8_t* src, int W, int H, int stride, float* dst,
@@ -1027,7 +949,7 @@ int DetSource::Processi8(int8_t* box_tensor, int32_t box_zp, float box_scale, in
                          int32_t score_zp, float score_scale, int8_t* score_sum_tensor,
                          int32_t score_sum_zp, float score_sum_scale, uint32_t grid_h,
                          uint32_t grid_w, uint32_t stride, uint32_t dfl_len,
-                         std::vector<float>& boxes, std::vector<float>& scores,
+                         std::vector<cv::Rect>& boxes, std::vector<float>& scores,
                          std::vector<int>& class_id) {
   int valid_count = 0;
   uint32_t grid_len = grid_h * grid_w;
@@ -1067,19 +989,14 @@ int DetSource::Processi8(int8_t* box_tensor, int32_t box_zp, float box_scale, in
         }
         compute_dfl(before_dfl.data(), dfl_len, box);
 
-        float x1, y1, x2, y2, w, h;
+        float x1, y1, x2, y2;
         x1 = (-box[0] + (float) j + 0.5f) * (float) stride;
         y1 = (-box[1] + (float) i + 0.5f) * (float) stride;
         x2 = (box[2] + (float) j + 0.5f) * (float) stride;
         y2 = (box[3] + (float) i + 0.5f) * (float) stride;
-        w = x2 - x1;
-        h = y2 - y1;
 
         // Save boxes
-        boxes.push_back(x1);
-        boxes.push_back(y1);
-        boxes.push_back(w);
-        boxes.push_back(h);
+        boxes.emplace_back(UnletterboxV2(x1, y1, x2, y2));
         // Save scores
         scores.push_back(deqnt_affine_to_f32(max_score, score_zp, score_scale));
         // Save class ids
@@ -1100,7 +1017,7 @@ std::vector<DetectedObject> DetSource::PostProcess() {
   uint32_t grid_h = 0;
   uint32_t grid_w = 0;
 
-  std::vector<float> boxes;
+  std::vector<cv::Rect> boxes;
   std::vector<float> scores;
   std::vector<int> class_ids;
 
@@ -1125,10 +1042,12 @@ std::vector<DetectedObject> DetSource::PostProcess() {
 
     // Process
     valid_count += Processi8(
-        (int8_t*) output_mems_[box_idx]->virt_addr, input_attrs_[box_idx].zp,
-        input_attrs_[box_idx].scale, (int8_t*) output_mems_[score_idx]->virt_addr,
-        output_attrs_[score_idx].zp, output_attrs_[score_idx].scale, (int8_t*) score_sum,
-        score_sum_zp, score_sum_scale, grid_h, grid_w, stride, dfl_len, boxes, scores, class_ids);
+        (int8_t*) output_mems_[box_idx]->virt_addr, output_attrs_[box_idx].zp, output_attrs_[box_idx].scale, 
+        (int8_t*) output_mems_[score_idx]->virt_addr, output_attrs_[score_idx].zp, output_attrs_[score_idx].scale, 
+        (int8_t*) score_sum, score_sum_zp, score_sum_scale, 
+        grid_h, grid_w, stride, dfl_len, 
+        boxes, scores, class_ids
+      );
   }
 
   if (valid_count <= 0) {
@@ -1138,38 +1057,14 @@ std::vector<DetectedObject> DetSource::PostProcess() {
 
   // Apply Non-Maximum Suppression (NMS)
   std::vector<int> indices;
-  indices.reserve(valid_count);
-  for (int i = 0; i < valid_count; ++i) {
-    indices.push_back(i);
-  }
-  // Sort
-  quick_sort_indices_inverse(scores, 0, valid_count - 1, indices);
-  // NMS
-  std::set<int> class_set(class_ids.begin(), class_ids.end());
-  for (auto c : class_set) {
-    nms(valid_count, boxes, class_ids, indices, c, kDetModelNmsThreshold);
-  }
+  indices.reserve(kMaxValidBBoxes);
+  cv::dnn::NMSBoxes(boxes, scores, kDetModelClassScoreThreshold, kDetModelNmsThreshold, indices,
+                    1.f, kMaxValidBBoxes * 2);
 
-  int last_count = 0;
   std::vector<DetectedObject> detected_objects;
   detected_objects.reserve(indices.size());
-  /* box valid detect target */
-  for (int i = 0; i < valid_count; ++i) {
-    if (indices[i] == -1 || last_count >= kNumOfClasses) {
-      continue;
-    }
-    int n = indices[i];
-
-    float x1 = boxes[n * 4 + 0];
-    float y1 = boxes[n * 4 + 1];
-    float x2 = x1 + boxes[n * 4 + 2];
-    float y2 = y1 + boxes[n * 4 + 3];
-
-    int id = class_ids[n];
-    float obj_conf = scores[i];
-    detected_objects.emplace_back(UnletterboxV2(x1, y1, x2, y2), id, obj_conf);
-
-    last_count++;
+  for (int idx : indices) {
+    detected_objects.emplace_back(boxes[idx], class_ids[idx], scores[idx]);
   }
 
   return detected_objects;
