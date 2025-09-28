@@ -52,7 +52,9 @@ unittest/example_test_result
 unittest/env_config.py
 
 examples/SlowFast/
-examples/openvino/python
+examples/openvino/python/*.rknn
+examples/openvino/python/*.npy
+examples/openvino/python/*.mp4
 examples/openvino/model
 examples/openvino/cpp/deps
 examples/openvino/cpp/src/onvif
