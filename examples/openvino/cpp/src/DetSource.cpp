@@ -552,11 +552,32 @@ int DetSource::Init() {
                                                      frame_width_, frame_height_);
   nv12_buffer_pool_ = std::make_unique<RgaBufferPool>(
       kMaxDecodedFrameBufferCount, RK_FORMAT_YCbCr_420_SP, frame_width_, frame_height_);
-  scale_buffer_pool_ = std::make_unique<RgaBufferPool>(
-      kMaxDecodedFrameBufferCount, RK_FORMAT_RGB_888, model_input_width_, model_input_height_);
 
   // create osd texts
   CreateOsdTexts();
+
+  // Try to import input tensor memory into RGA
+  int fd = input_mems_[0]->fd;
+  input_tensor_rga_buffer_.handle = -1;
+  if (fd != 0) {
+    LOGD(TAG, "Importing input tensor memory into RGA buffer");
+    im_handle_param_t handle_param{};
+    handle_param.width = model_input_width_;
+    handle_param.height = MPP_ALIGN(model_input_height_, 16);
+    handle_param.format = RK_FORMAT_RGB_888;
+    rga_buffer_handle_t rga_handle = importbuffer_fd(fd, &handle_param);
+    if (rga_handle > 0) {
+      input_tensor_rga_buffer_ = wrapbuffer_handle(
+          rga_handle, model_input_width_, model_input_height_, (int) handle_param.format,
+          MPP_ALIGN(model_input_width_, 16), MPP_ALIGN(model_input_height_, 16));
+      LOGD(TAG, "Input tensor memory imported");
+    }
+  }
+  if (input_tensor_rga_buffer_.handle <= 0) {
+    // fallback to `scale_buffer_pool_`
+    scale_buffer_pool_ = std::make_unique<RgaBufferPool>(
+        kMaxDecodedFrameBufferCount, RK_FORMAT_RGB_888, model_input_width_, model_input_height_);
+  }
 
   return 0;
 }
@@ -724,7 +745,7 @@ rga_buffer_t* DetSource::GetImportedRgaBuffer() {
   return rga_buffers_.at(last_success_fd_).get();
 }
 
-rga_buffer_t* DetSource::Convert2RGBA(rga_buffer_t* src) {
+rga_buffer_t* DetSource::Convert2RGB24(rga_buffer_t* src) {
   rga_buffer_t* dst = rgb_buffer_pool_->Acquire();
   if (dst == nullptr) {
     LOGE(TAG, "failed to acquire rga buffer");
@@ -760,7 +781,13 @@ rga_buffer_t* DetSource::Letterbox(rga_buffer_t* src) {
   auto width = (float) src->width * letter_box_.scale;
   auto height = (float) src->height * letter_box_.scale;
 
-  rga_buffer_t* scale_dst = scale_buffer_pool_->Acquire();
+  rga_buffer_t* scale_dst = nullptr;
+  if (input_tensor_rga_buffer_.handle > 0) {
+    scale_dst = &input_tensor_rga_buffer_;
+  } else {
+    rga_buffer_t* scale_dst = scale_buffer_pool_->Acquire();
+  }
+
   if (scale_dst == nullptr) {
     LOGE(TAG, "failed to acquire rga buffer");
     return nullptr;
@@ -802,7 +829,7 @@ void DetSource::MainLoop() {
     }
 
     // Convert to RGBA32
-    rga_buffer_t* rgb_buffer = Convert2RGBA(src_buffer);
+    rga_buffer_t* rgb_buffer = Convert2RGB24(src_buffer);
     if (rgb_buffer == nullptr) {
       std::this_thread::sleep_for(std::chrono::milliseconds(kDefaultWaitingTimeInMs));
       continue;
@@ -823,7 +850,9 @@ void DetSource::MainLoop() {
     }
 
 #if USE_QUANTIZED_MODEL
-    memcpy(mem->virt_addr, scaled_buffer->vir_addr, mem->size);
+    if (input_tensor_rga_buffer_.handle <= 0) {
+      memcpy(mem->virt_addr, scaled_buffer->vir_addr, mem->size);
+    }
 #else
     // Convert RGB24 to NHWC float32
     rgb24_to_nhwc_float_stride((uint8_t*) scaled_buffer->vir_addr, model_input_width_,
@@ -1042,12 +1071,10 @@ std::vector<DetectedObject> DetSource::PostProcess() {
 
     // Process
     valid_count += Processi8(
-        (int8_t*) output_mems_[box_idx]->virt_addr, output_attrs_[box_idx].zp, output_attrs_[box_idx].scale, 
-        (int8_t*) output_mems_[score_idx]->virt_addr, output_attrs_[score_idx].zp, output_attrs_[score_idx].scale, 
-        (int8_t*) score_sum, score_sum_zp, score_sum_scale, 
-        grid_h, grid_w, stride, dfl_len, 
-        boxes, scores, class_ids
-      );
+        (int8_t*) output_mems_[box_idx]->virt_addr, output_attrs_[box_idx].zp,
+        output_attrs_[box_idx].scale, (int8_t*) output_mems_[score_idx]->virt_addr,
+        output_attrs_[score_idx].zp, output_attrs_[score_idx].scale, (int8_t*) score_sum,
+        score_sum_zp, score_sum_scale, grid_h, grid_w, stride, dfl_len, boxes, scores, class_ids);
   }
 
   if (valid_count <= 0) {

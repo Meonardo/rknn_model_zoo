@@ -130,6 +130,7 @@ class DetSource : public RawVideoSink, public VideoSource {
   std::vector<VideoSink*> sinks_;
   std::mutex sink_mutex_;
   VideoFrameSlot current_frame_;
+  rga_buffer_t input_tensor_rga_buffer_;
 
   int Init();
   void DeInit();
@@ -137,7 +138,7 @@ class DetSource : public RawVideoSink, public VideoSource {
   void DestroyOsdTexts();
 
   static bool ImportRgaBuffer(const VideoFrameSlot& frame, rga_buffer_t* buffer);
-  rga_buffer_t* Convert2RGBA(rga_buffer_t* src);
+  rga_buffer_t* Convert2RGB24(rga_buffer_t* src);
   rga_buffer_t* Convert2NV12(rga_buffer_t* src);
   rga_buffer_t* Letterbox(rga_buffer_t* src);
   rga_buffer_t* GetImportedRgaBuffer();
