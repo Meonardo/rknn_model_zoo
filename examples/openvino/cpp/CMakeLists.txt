@@ -17,7 +17,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Since this is the top level CMakeLists.txt, the project name is also accessible
 # with ${CMAKE_PROJECT_NAME} (both CMake variables are in-sync within the top level
 # build script scope).
-project("action_detector")
+project("detection")
 set(ANDROID_APK OFF)
 
 # Creates and names a library, sets it as either STATIC

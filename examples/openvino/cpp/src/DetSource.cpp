@@ -60,6 +60,77 @@ static unsigned char* load_model(const char* filename, uint32_t* model_size) {
   return model;
 }
 
+static int create_rga_buffer(uint32_t w, uint32_t h, RgaSURF_FORMAT fmt, rga_buffer_t& out_buffer) {
+  int ret = 0;
+  int fd = 0;
+  void* vir_addr = nullptr;
+  rga_buffer_handle_t rga_handle = 0;
+  uint32_t rga_buffer_size = 0;
+  uint32_t hor_stride = MPP_ALIGN(w, 16);
+  uint32_t ver_stride = MPP_ALIGN(h, 16);
+
+  if (fmt == RK_FORMAT_RGB_888) {
+    rga_buffer_size = hor_stride * ver_stride * 3;
+  } else if (fmt == RK_FORMAT_YCbCr_420_SP) {
+    rga_buffer_size = hor_stride * ver_stride * 3 / 2;
+  } else {
+    assert(false && "create_rga_buffer: unsupported format");
+  }
+
+  ret = dma_buf_alloc(DMA_HEAP_DMA32_UNCACHED_PATH, rga_buffer_size, &fd, (void**) &vir_addr);
+  if (ret != 0) {
+    LOGE(TAG, "Create dma buffer failed: ret: %d", ret);
+    return ret;
+  }
+
+  if (vir_addr != nullptr) {
+    if (fmt == RK_FORMAT_RGB_888) {
+      memset(vir_addr, 0x00, rga_buffer_size);  // black
+    } else if (fmt == RK_FORMAT_YCbCr_420_SP) {
+      size_t y_size = hor_stride * ver_stride;
+      size_t uv_size = y_size / 2;
+      memset(vir_addr, 0x00, y_size);                    // Y plane black
+      memset((char*) vir_addr + y_size, 0x80, uv_size);  // UV plane gray
+    }
+  }
+
+  im_handle_param_t handle_param;
+  handle_param.width = w;
+  handle_param.height = ver_stride;
+  handle_param.format = fmt;
+
+  rga_handle = importbuffer_fd(fd, &handle_param);
+  if (rga_handle == 0) {
+    LOGE(TAG, "rga import dma buffer failed, fd=%d", fd);
+    dma_buf_free(rga_buffer_size, &fd, vir_addr);
+    return rga_handle;
+  }
+
+  out_buffer = wrapbuffer_handle(rga_handle, w, h, (int) fmt, hor_stride, ver_stride);
+  out_buffer.fd = fd;              // keep the fd for later free
+  out_buffer.vir_addr = vir_addr;  // keep the vir_addr for later free
+
+  return ret;
+}
+
+static void release_rga_buffer(rga_buffer_t& buffer) {
+  if (buffer.handle > 0) {
+    releasebuffer_handle(buffer.handle);
+    buffer.handle = -1;
+  }
+  if (buffer.fd > 0) {
+    uint32_t buf_size = 0;
+    if (buffer.format == RK_FORMAT_RGB_888) {
+      buf_size = buffer.wstride * buffer.hstride * 3;
+    } else if (buffer.format == RK_FORMAT_YCbCr_420_SP) {
+      buf_size = buffer.wstride * buffer.hstride * 3 / 2;
+    }
+    dma_buf_free(buf_size, &buffer.fd, buffer.vir_addr);
+    buffer.fd = -1;
+    buffer.vir_addr = nullptr;
+  }
+}
+
 #if USE_QUANTIZED_MODEL
 
 static inline float fast_exp(float x) {
@@ -545,39 +616,12 @@ int DetSource::Init() {
     LOGI(TAG, "Model input width: %u, height: %u", model_input_width_, model_input_height_);
   }
 
-  // create ring buffer
+  // Create ring buffer
   ring_buffer_ = std::make_unique<RingBuffer<VideoFrameSlot> >(kDefaultRingBufferSize);
-  // create rga buffer pools
-  rgb_buffer_pool_ = std::make_unique<RgaBufferPool>(kMaxDecodedFrameBufferCount, RK_FORMAT_RGB_888,
-                                                     frame_width_, frame_height_);
-  nv12_buffer_pool_ = std::make_unique<RgaBufferPool>(
-      kMaxDecodedFrameBufferCount, RK_FORMAT_YCbCr_420_SP, frame_width_, frame_height_);
-
-  // create osd texts
+  // Create rga buffers
+  CreateRgaBuffers();
+  // Create osd texts
   CreateOsdTexts();
-
-  // Try to import input tensor memory into RGA
-  int fd = input_mems_[0]->fd;
-  input_tensor_rga_buffer_.handle = -1;
-  if (fd != 0) {
-    LOGD(TAG, "Importing input tensor memory into RGA buffer");
-    im_handle_param_t handle_param{};
-    handle_param.width = model_input_width_;
-    handle_param.height = MPP_ALIGN(model_input_height_, 16);
-    handle_param.format = RK_FORMAT_RGB_888;
-    rga_buffer_handle_t rga_handle = importbuffer_fd(fd, &handle_param);
-    if (rga_handle > 0) {
-      input_tensor_rga_buffer_ = wrapbuffer_handle(
-          rga_handle, model_input_width_, model_input_height_, (int) handle_param.format,
-          MPP_ALIGN(model_input_width_, 16), MPP_ALIGN(model_input_height_, 16));
-      LOGD(TAG, "Input tensor memory imported");
-    }
-  }
-  if (input_tensor_rga_buffer_.handle <= 0) {
-    // fallback to `scale_buffer_pool_`
-    scale_buffer_pool_ = std::make_unique<RgaBufferPool>(
-        kMaxDecodedFrameBufferCount, RK_FORMAT_RGB_888, model_input_width_, model_input_height_);
-  }
 
   return 0;
 }
@@ -585,6 +629,9 @@ int DetSource::Init() {
 void DetSource::DeInit() {
   // Stop first
   Stop();
+
+  // Release RGA buffers
+  DestroyRgaBuffers();
 
   // Free input and output memory
   for (auto* mem : input_mems_) {
@@ -605,6 +652,64 @@ void DetSource::DeInit() {
   DestroyOsdTexts();
 
   LOGI(TAG, "DetSource deinitialized successfully");
+}
+
+void DetSource::CreateRgaBuffers() {
+  int ret = 0;
+  // RGB24 buffer for input: NV12 -> RGB24
+  ret = create_rga_buffer(frame_width_, frame_height_, RK_FORMAT_RGB_888, rgb_buffer_);
+  if (ret != 0) {
+    LOGE(TAG, "create rgb buffer failed: %d", ret);
+    return;
+  }
+
+  // NV12 buffer for output, RGB24 -> NV12
+  ret = create_rga_buffer(frame_width_, frame_height_, RK_FORMAT_YCbCr_420_SP, output_nv12_buffer_);
+  if (ret != 0) {
+    LOGE(TAG, "create rgb buffer failed: %d", ret);
+    return;
+  }
+
+  // Try to import input tensor memory into RGA
+  int fd = input_mems_[0]->fd;
+  input_tensor_rga_buffer_.handle = -1;
+  if (fd != 0) {
+    LOGD(TAG, "Importing input tensor memory into RGA buffer");
+    im_handle_param_t handle_param{};
+    handle_param.width = model_input_width_;
+    handle_param.height = MPP_ALIGN(model_input_height_, 16);
+    handle_param.format = RK_FORMAT_RGB_888;
+    rga_buffer_handle_t rga_handle = importbuffer_fd(fd, &handle_param);
+    if (rga_handle > 0) {
+      input_tensor_rga_buffer_ = wrapbuffer_handle(
+          rga_handle, model_input_width_, model_input_height_, (int) handle_param.format,
+          MPP_ALIGN(model_input_width_, 16), MPP_ALIGN(model_input_height_, 16));
+      LOGD(TAG, "Input tensor memory imported");
+    }
+  }
+  if (input_tensor_rga_buffer_.handle <= 0) {
+    // fallback to DMA buffer
+    ret = create_rga_buffer(model_input_width_, model_input_height_, RK_FORMAT_RGB_888,
+                            input_tensor_rga_buffer_);
+    if (ret != 0) {
+      LOGE(TAG, "create scale buffer(for input tensor memory) failed: %d", ret);
+      return;
+    }
+  }
+}
+
+void DetSource::DestroyRgaBuffers() {
+  // Release the input tensor RGA buffer
+  if (input_tensor_rga_buffer_.handle > 0) {
+    releasebuffer_handle(input_tensor_rga_buffer_.handle);
+    input_tensor_rga_buffer_.handle = -1;
+  }
+  release_rga_buffer(rgb_buffer_);
+  release_rga_buffer(output_nv12_buffer_);
+
+  rga_buffers_.clear();
+  last_success_fd_ = -1;
+  ready_.store(false);
 }
 
 void DetSource::CreateOsdTexts() {
@@ -746,68 +851,59 @@ rga_buffer_t* DetSource::GetImportedRgaBuffer() {
 }
 
 rga_buffer_t* DetSource::Convert2RGB24(rga_buffer_t* src) {
-  rga_buffer_t* dst = rgb_buffer_pool_->Acquire();
-  if (dst == nullptr) {
-    LOGE(TAG, "failed to acquire rga buffer");
+  if (rgb_buffer_.handle == 0) {
+    LOGE(TAG, "failed to acquire RGB rga buffer");
     return nullptr;
   }
 
-  auto ret = imcvtcolor(*src, *dst, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888);
+  auto ret = imcvtcolor(*src, rgb_buffer_, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888);
   if (IM_STATUS_SUCCESS != ret) {
     LOGE(TAG, "convert to rgb888 failed, %s", imStrError(ret));
     return nullptr;
   }
 
-  return dst;
+  return &rgb_buffer_;
 }
 
 rga_buffer_t* DetSource::Convert2NV12(rga_buffer_t* src) {
-  rga_buffer_t* dst = nv12_buffer_pool_->Acquire();
-  if (dst == nullptr) {
-    LOGE(TAG, "failed to acquire rga buffer");
+  if (output_nv12_buffer_.handle == 0) {
+    LOGE(TAG, "failed to acquire NV12 rga buffer");
     return nullptr;
   }
 
-  auto ret = imcvtcolor(*src, *dst, RK_FORMAT_RGB_888, RK_FORMAT_YCbCr_420_SP);
+  auto ret = imcvtcolor(*src, output_nv12_buffer_, RK_FORMAT_RGB_888, RK_FORMAT_YCbCr_420_SP);
   if (IM_STATUS_SUCCESS != ret) {
-    LOGE(TAG, "convert to rgb888 failed, %s", imStrError(ret));
+    LOGE(TAG, "convert to NV12 failed, %s", imStrError(ret));
     return nullptr;
   }
 
-  return dst;
+  return &output_nv12_buffer_;
 }
 
 rga_buffer_t* DetSource::Letterbox(rga_buffer_t* src) {
+  if (input_tensor_rga_buffer_.handle == 0) {
+    LOGE(TAG, "failed to acquire scale rga buffer");
+    return nullptr;
+  }
+
   auto width = (float) src->width * letter_box_.scale;
   auto height = (float) src->height * letter_box_.scale;
 
-  rga_buffer_t* scale_dst = nullptr;
-  if (input_tensor_rga_buffer_.handle > 0) {
-    scale_dst = &input_tensor_rga_buffer_;
-  } else {
-    rga_buffer_t* scale_dst = scale_buffer_pool_->Acquire();
-  }
-
-  if (scale_dst == nullptr) {
-    LOGE(TAG, "failed to acquire rga buffer");
-    return nullptr;
-  }
-
   im_rect rect = {letter_box_.x_pad, letter_box_.y_pad, (int) width, (int) height};
 
-  auto ret = imcheck(*src, *scale_dst, {}, rect);
+  auto ret = imcheck(*src, input_tensor_rga_buffer_, {}, rect);
   if (IM_STATUS_NOERROR != ret) {
-    LOGE(TAG, "scale to file check failed, %s", imStrError(ret));
+    LOGE(TAG, "letterbox with rga check failed, %s", imStrError(ret));
     return nullptr;
   }
 
-  ret = improcess(*src, *scale_dst, {}, {}, rect, {}, IM_SYNC);
+  ret = improcess(*src, input_tensor_rga_buffer_, {}, {}, rect, {}, IM_SYNC);
   if (IM_STATUS_SUCCESS != ret) {
-    LOGE(TAG, "scale to file failed, %s", imStrError(ret));
+    LOGE(TAG, "letterbox with rga failed, %s", imStrError(ret));
     return nullptr;
   }
 
-  return scale_dst;
+  return &input_tensor_rga_buffer_;
 }
 
 void DetSource::MainLoop() {
@@ -828,7 +924,7 @@ void DetSource::MainLoop() {
       continue;
     }
 
-    // Convert to RGBA32
+    // Convert to RGB24
     rga_buffer_t* rgb_buffer = Convert2RGB24(src_buffer);
     if (rgb_buffer == nullptr) {
       std::this_thread::sleep_for(std::chrono::milliseconds(kDefaultWaitingTimeInMs));

@@ -111,12 +111,13 @@ class DetSource : public RawVideoSink, public VideoSource {
   std::vector<rknn_tensor_mem*> input_mems_;
   std::vector<rknn_tensor_mem*> output_mems_;
 
-  // buffers
+  // RGA buffers
   std::unique_ptr<RingBuffer<VideoFrameSlot>> ring_buffer_;
-  std::unique_ptr<RgaBufferPool> scale_buffer_pool_;
-  std::unique_ptr<RgaBufferPool> rgb_buffer_pool_;
-  std::unique_ptr<RgaBufferPool> nv12_buffer_pool_;
   std::unordered_map<int, std::unique_ptr<rga_buffer_t>> rga_buffers_;
+  rga_buffer_t rgb_buffer_;
+  rga_buffer_t output_nv12_buffer_;
+  rga_buffer_t input_tensor_rga_buffer_;
+
   int last_success_fd_;
   std::atomic<bool> ready_;
   LetterBox letter_box_;
@@ -130,10 +131,11 @@ class DetSource : public RawVideoSink, public VideoSource {
   std::vector<VideoSink*> sinks_;
   std::mutex sink_mutex_;
   VideoFrameSlot current_frame_;
-  rga_buffer_t input_tensor_rga_buffer_;
 
   int Init();
   void DeInit();
+  void CreateRgaBuffers();
+  void DestroyRgaBuffers();
   void CreateOsdTexts();
   void DestroyOsdTexts();
 

@@ -59,11 +59,11 @@ make -j$(nproc)
 
 if [ "$MODE" == "Release" ]; then
   # Strip the binary
-  $STRIP --strip-unneeded action_detector
+  $STRIP --strip-unneeded detection
 fi
 
 # Copy the binary to the install directory
-cp action_detector $INSTALL_DIR/bin
+cp detection $INSTALL_DIR/bin
 # Copy deps lib to the install directory
 cp ../../../../3rdparty/rknpu2/Android/arm64-v8a/librknnrt.so $INSTALL_DIR/lib
 cp ../deps/mpp/lib/librockchip_mpp.so $INSTALL_DIR/lib

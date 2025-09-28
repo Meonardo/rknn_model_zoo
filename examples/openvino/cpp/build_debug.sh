@@ -11,9 +11,9 @@ cd $SCRIPT_DIR
 
 # 2. run lldb.sh
 ./lldb.sh \
-  --bin $SCRIPT_DIR/build/action_detector \
+  --bin $SCRIPT_DIR/build/detection \
   --libdir $SCRIPT_DIR/install/arm64-v8a/Debug/lib \
   --remote-lldb /data/local/tmp/lldb-server \
-  --remote-bin /data/local/tmp/lldb-standalone/bin/action_detector \
+  --remote-bin /data/local/tmp/lldb-standalone/bin/detection \
   --root \
   -v
