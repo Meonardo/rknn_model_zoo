@@ -5,10 +5,15 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <set>
 
 #include "Common.h"
 
+#if USE_QUANTIZED_MODEL
+#define MODEL_PATH "/data/local/tmp/lldb-standalone/hand_sign_v8n_i8.rknn"
+#else
 #define MODEL_PATH "/data/local/tmp/lldb-standalone/hand_sign_v8n_f32.rknn"
+#endif
 
 #define TAG "DetSource"
 
@@ -55,6 +60,137 @@ static unsigned char* load_model(const char* filename, uint32_t* model_size) {
   return model;
 }
 
+#if USE_QUANTIZED_MODEL
+
+static inline float fast_exp(float x) {
+  // return exp(x);
+  union {
+    uint32_t i;
+    float f;
+  } v;
+  v.i = (12102203.1616540672 * x + 1064807160.56887296);
+  return v.f;
+}
+
+static float sigmoid(float x) {
+  return 1.0 / (1.0 + fast_exp(-x));
+}
+
+static float unsigmoid(float y) {
+  return -1.0 * logf((1.0 / y) - 1.0);
+}
+
+inline static int32_t __clip(float val, float min, float max) {
+  float f = val <= min ? min : (val >= max ? max : val);
+  return f;
+}
+
+static int8_t qnt_f32_to_affine(float f32, int32_t zp, float scale) {
+  float dst_val = (f32 / scale) + zp;
+  int8_t res = (int8_t) __clip(dst_val, -128, 127);
+  return res;
+}
+
+static float deqnt_affine_to_f32(int8_t qnt, int32_t zp, float scale) {
+  return ((float) qnt - (float) zp) * scale;
+}
+
+static void compute_dfl(float* tensor, int dfl_len, float* box) {
+  for (int b = 0; b < 4; b++) {
+    std::vector<float> exp_t(dfl_len);
+    float exp_sum = 0;
+    float acc_sum = 0;
+    for (int i = 0; i < dfl_len; i++) {
+      exp_t[i] = fast_exp(tensor[i + b * dfl_len]);
+      exp_sum += exp_t[i];
+    }
+
+    for (int i = 0; i < dfl_len; i++) {
+      acc_sum += exp_t[i] / exp_sum * i;
+    }
+    box[b] = acc_sum;
+  }
+}
+
+static float calculate_overlap(float xmin0, float ymin0, float xmax0, float ymax0, float xmin1,
+                               float ymin1, float xmax1, float ymax1) {
+  auto w = fmax(0.f, fmin(xmax0, xmax1) - fmax(xmin0, xmin1) + 1.0);
+  auto h = fmax(0.f, fmin(ymax0, ymax1) - fmax(ymin0, ymin1) + 1.0);
+  auto i = w * h;
+  auto u = (xmax0 - xmin0 + 1.0) * (ymax0 - ymin0 + 1.0) +
+           (xmax1 - xmin1 + 1.0) * (ymax1 - ymin1 + 1.0) - i;
+  return u <= 0.f ? 0.f : (float) (i / u);
+}
+
+inline static int clamp(float val, int min, int max) {
+  return val > min ? (val < max ? val : max) : min;
+}
+
+static int nms(int valid_count, std::vector<float>& output_locations, std::vector<int> class_ids,
+               std::vector<int>& order, int filter_id, float threshold) {
+  for (int i = 0; i < valid_count; ++i) {
+    int n = order[i];
+    if (n == -1 || class_ids[n] != filter_id) {
+      continue;
+    }
+
+    for (int j = i + 1; j < valid_count; ++j) {
+      int m = order[j];
+      if (m == -1 || class_ids[m] != filter_id) {
+        continue;
+      }
+
+      float xmin0 = output_locations[n * 4 + 0];
+      float ymin0 = output_locations[n * 4 + 1];
+      float xmax0 = output_locations[n * 4 + 0] + output_locations[n * 4 + 2];
+      float ymax0 = output_locations[n * 4 + 1] + output_locations[n * 4 + 3];
+
+      float xmin1 = output_locations[m * 4 + 0];
+      float ymin1 = output_locations[m * 4 + 1];
+      float xmax1 = output_locations[m * 4 + 0] + output_locations[m * 4 + 2];
+      float ymax1 = output_locations[m * 4 + 1] + output_locations[m * 4 + 3];
+
+      // calculate IoU (Intersection over Union)
+      float iou = calculate_overlap(xmin0, ymin0, xmax0, ymax0, xmin1, ymin1, xmax1, ymax1);
+
+      if (iou > threshold) {
+        order[j] = -1;
+      }
+    }
+  }
+  return 0;
+}
+
+static int quick_sort_indices_inverse(std::vector<float>& input, int left, int right,
+                                      std::vector<int>& indices) {
+  float key;
+  int key_index;
+  int low = left;
+  int high = right;
+  if (left < right) {
+    key_index = indices[left];
+    key = input[left];
+    while (low < high) {
+      while (low < high && input[high] <= key) {
+        high--;
+      }
+      input[low] = input[high];
+      indices[low] = indices[high];
+      while (low < high && input[low] >= key) {
+        low++;
+      }
+      input[high] = input[low];
+      indices[high] = indices[low];
+    }
+    input[low] = key;
+    indices[low] = key_index;
+    quick_sort_indices_inverse(input, left, low - 1, indices);
+    quick_sort_indices_inverse(input, low + 1, right, indices);
+  }
+  return low;
+}
+
+#else
 // Convert RGB24 to NHWC float32 with stride support
 static void rgb24_to_nhwc_float_stride(const uint8_t* src, int W, int H, int stride, float* dst,
                                        float scale) {
@@ -116,6 +252,7 @@ static void rgb24_to_nhwc_float(const uint8_t* src, int W, int H, float* dst, fl
     }
   }
 }
+#endif
 
 // Simple word-wrap using Hershey metrics.
 static std::vector<std::string> wrap_text(const std::string& text, int max_width_px, int font_face,
@@ -428,6 +565,9 @@ int DetSource::Init() {
       input_attrs_[i].size_with_stride = size;
       mem = rknn_create_mem(rknn_ctx_, size);
     } else {
+      // default input type is int8 (normalize and quantize need compute in outside)
+      // if set uint8, will fuse normalize and quantize to npu
+      input_attrs_[i].type = RKNN_TENSOR_UINT8;
       mem = rknn_create_mem(rknn_ctx_, input_attrs_[i].size_with_stride);
     }
     if (!mem) {
@@ -456,6 +596,10 @@ int DetSource::Init() {
       output_attrs_[i].size_with_stride = size;
       mem = rknn_create_mem(rknn_ctx_, size);
     } else {
+      if (std::fabs(output_attrs_[i].scale) < std::numeric_limits<float>::epsilon()) {
+        LOGE(TAG, "scale can't be equal to 0");
+        output_attrs_[i].scale = 1.0;  // set a small value
+      }
       mem = rknn_create_mem(rknn_ctx_, output_attrs_[i].size_with_stride);
     }
     if (!mem) {
@@ -755,13 +899,15 @@ void DetSource::MainLoop() {
       LOGE(TAG, "input mem is null");
       return;
     }
+
+#if USE_QUANTIZED_MODEL
+    memcpy(mem->virt_addr, scaled_buffer->vir_addr, mem->size);
+#else
     // Convert RGB24 to NHWC float32
     rgb24_to_nhwc_float_stride((uint8_t*) scaled_buffer->vir_addr, model_input_width_,
                                model_input_height_, (int) scaled_buffer->wstride,
                                (float*) mem->virt_addr, 1.0f);
-    // rgba32_to_nhwc_i8_stride((uint8_t*) scaled_buffer->vir_addr, model_input_width_,
-    //                          model_input_height_, (int) scaled_buffer->wstride,
-    //                          (int8_t*) mem->virt_addr);
+#endif
 
     // Inference
     auto ret = rknn_run(rknn_ctx_, nullptr);
@@ -854,6 +1000,182 @@ cv::Rect DetSource::Unletterbox(float cx, float cy, float w, float h) {
   return cv::Rect(X, Y, W, H);
 }
 
+cv::Rect DetSource::UnletterboxV2(float x0, float y0, float x1, float y1) {
+  // Map to original space
+  x0 = (x0 - letter_box_.x_pad) / letter_box_.scale;
+  y0 = (y0 - letter_box_.y_pad) / letter_box_.scale;
+  x1 = (x1 - letter_box_.x_pad) / letter_box_.scale;
+  y1 = (y1 - letter_box_.y_pad) / letter_box_.scale;
+
+  // Clamp
+  x0 = std::max(0.0f, std::min(x0, (float) frame_width_));
+  y0 = std::max(0.0f, std::min(y0, (float) frame_height_));
+  x1 = std::max(0.0f, std::min(x1, (float) frame_width_));
+  y1 = std::max(0.0f, std::min(y1, (float) frame_height_));
+
+  int X = (int) std::round(x0);
+  int Y = (int) std::round(y0);
+  int W = (int) std::round(std::max(0.0f, x1 - x0));
+  int H = (int) std::round(std::max(0.0f, y1 - y0));
+
+  return cv::Rect(X, Y, W, H);
+}
+
+#if USE_QUANTIZED_MODEL
+
+int DetSource::Processi8(int8_t* box_tensor, int32_t box_zp, float box_scale, int8_t* score_tensor,
+                         int32_t score_zp, float score_scale, int8_t* score_sum_tensor,
+                         int32_t score_sum_zp, float score_sum_scale, uint32_t grid_h,
+                         uint32_t grid_w, uint32_t stride, uint32_t dfl_len,
+                         std::vector<float>& boxes, std::vector<float>& scores,
+                         std::vector<int>& class_id) {
+  int valid_count = 0;
+  uint32_t grid_len = grid_h * grid_w;
+  int8_t score_thres_i8 = qnt_f32_to_affine(kDetModelClassScoreThreshold, score_zp, score_scale);
+  int8_t score_sum_thres_i8 =
+      qnt_f32_to_affine(kDetModelClassScoreThreshold, score_sum_zp, score_sum_scale);
+
+  for (uint32_t i = 0; i < grid_h; ++i) {
+    for (uint32_t j = 0; j < grid_w; ++j) {
+      uint32_t offset = i * grid_w + j;
+      int max_class_id = -1;
+
+      if (score_sum_tensor != nullptr) {
+        if (score_sum_tensor[offset] < score_sum_thres_i8) {
+          continue;
+        }
+      }
+
+      int8_t max_score = -score_zp;
+      for (int c = 0; c < kNumOfClasses; ++c) {
+        if ((score_tensor[offset] > score_thres_i8) && (score_tensor[offset] > max_score)) {
+          max_score = score_tensor[offset];
+          max_class_id = c;
+        }
+        offset += grid_len;
+      }
+
+      // Compute box
+      if (max_score > score_thres_i8) {
+        offset = i * grid_w + j;
+
+        float box[4] = {0};
+        std::vector<float> before_dfl(dfl_len * 4);
+        for (int k = 0; k < dfl_len * 4; k++) {
+          before_dfl[k] = deqnt_affine_to_f32(box_tensor[offset], box_zp, box_scale);
+          offset += grid_len;
+        }
+        compute_dfl(before_dfl.data(), dfl_len, box);
+
+        float x1, y1, x2, y2, w, h;
+        x1 = (-box[0] + (float) j + 0.5f) * (float) stride;
+        y1 = (-box[1] + (float) i + 0.5f) * (float) stride;
+        x2 = (box[2] + (float) j + 0.5f) * (float) stride;
+        y2 = (box[3] + (float) i + 0.5f) * (float) stride;
+        w = x2 - x1;
+        h = y2 - y1;
+
+        // Save boxes
+        boxes.push_back(x1);
+        boxes.push_back(y1);
+        boxes.push_back(w);
+        boxes.push_back(h);
+        // Save scores
+        scores.push_back(deqnt_affine_to_f32(max_score, score_zp, score_scale));
+        // Save class ids
+        class_id.push_back(max_class_id);
+
+        valid_count++;
+      }
+    }
+  }
+
+  return valid_count;
+}
+
+std::vector<DetectedObject> DetSource::PostProcess() {
+  uint32_t dfl_len = output_attrs_[0].dims[1] / 4;    // 64 / 4 = 16
+  uint32_t output_per_branch = io_num_.n_output / 3;  // 9 / 3 = 3
+  uint32_t stride = 0;
+  uint32_t grid_h = 0;
+  uint32_t grid_w = 0;
+
+  std::vector<float> boxes;
+  std::vector<float> scores;
+  std::vector<int> class_ids;
+
+  int valid_count = 0;
+
+  for (uint32_t i = 0; i < 3; ++i) {
+    void* score_sum = nullptr;
+    int32_t score_sum_zp = 0;
+    float score_sum_scale = 1.0;
+    if (output_per_branch == 3) {
+      score_sum = output_mems_[i * output_per_branch + 2]->virt_addr;
+      score_sum_zp = output_attrs_[i * output_per_branch + 2].zp;
+      score_sum_scale = output_attrs_[i * output_per_branch + 2].scale;
+    }
+
+    uint32_t box_idx = i * output_per_branch;
+    uint32_t score_idx = i * output_per_branch + 1;
+
+    grid_h = output_attrs_[box_idx].dims[2];
+    grid_w = output_attrs_[box_idx].dims[3];
+    stride = model_input_height_ / grid_h;
+
+    // Process
+    valid_count += Processi8(
+        (int8_t*) output_mems_[box_idx]->virt_addr, input_attrs_[box_idx].zp,
+        input_attrs_[box_idx].scale, (int8_t*) output_mems_[score_idx]->virt_addr,
+        output_attrs_[score_idx].zp, output_attrs_[score_idx].scale, (int8_t*) score_sum,
+        score_sum_zp, score_sum_scale, grid_h, grid_w, stride, dfl_len, boxes, scores, class_ids);
+  }
+
+  if (valid_count <= 0) {
+    // LOGW(TAG, "No valid boxes found after thresholding");
+    return {};  // No valid boxes to process
+  }
+
+  // Apply Non-Maximum Suppression (NMS)
+  std::vector<int> indices;
+  indices.reserve(valid_count);
+  for (int i = 0; i < valid_count; ++i) {
+    indices.push_back(i);
+  }
+  // Sort
+  quick_sort_indices_inverse(scores, 0, valid_count - 1, indices);
+  // NMS
+  std::set<int> class_set(class_ids.begin(), class_ids.end());
+  for (auto c : class_set) {
+    nms(valid_count, boxes, class_ids, indices, c, kDetModelNmsThreshold);
+  }
+
+  int last_count = 0;
+  std::vector<DetectedObject> detected_objects;
+  detected_objects.reserve(indices.size());
+  /* box valid detect target */
+  for (int i = 0; i < valid_count; ++i) {
+    if (indices[i] == -1 || last_count >= kNumOfClasses) {
+      continue;
+    }
+    int n = indices[i];
+
+    float x1 = boxes[n * 4 + 0];
+    float y1 = boxes[n * 4 + 1];
+    float x2 = x1 + boxes[n * 4 + 2];
+    float y2 = y1 + boxes[n * 4 + 3];
+
+    int id = class_ids[n];
+    float obj_conf = scores[i];
+    detected_objects.emplace_back(UnletterboxV2(x1, y1, x2, y2), id, obj_conf);
+
+    last_count++;
+  }
+
+  return detected_objects;
+}
+
+#else
 std::vector<DetectedObject> DetSource::PostProcess() {
   const float* output = (float*) output_mems_[0]->virt_addr;
 
@@ -924,6 +1246,7 @@ std::vector<DetectedObject> DetSource::PostProcess() {
 
   return detected_objects;
 }
+#endif
 
 void DetSource::DrawOsd(rga_buffer_t* buffer, const std::vector<DetectedObject>& objects) {
   if (objects.empty()) {

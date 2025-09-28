@@ -90,6 +90,7 @@ target_compile_definitions(
 
         PRIVATE
         USE_MPP_BUFFER
+        USE_QUANTIZED_MODEL
 )
 
 find_package(OpenMP)
