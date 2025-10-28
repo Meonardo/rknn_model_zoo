@@ -7,6 +7,7 @@
 #include "OnvifCore.h"
 #include "OnvifSink.h"
 #include "RtspSource.h"
+#include "CameraSource.h"
 #include "DetSource.h"
 
 #define TAG "App"
@@ -17,27 +18,45 @@ struct RtspStream {
   std::unique_ptr<rtsp::OnvifSink> onvif_sink = nullptr;
   // Sources
   std::unique_ptr<rtsp::RtspSource> video_source = nullptr;
+  std::unique_ptr<CameraSource> camera_source = nullptr;
   std::unique_ptr<det::DetSource> det_source = nullptr;
 
   void Start() {
-    // Start video source
-    video_source->Start();
+    if (video_source != nullptr) {
+      // Start video source
+      video_source->Start();
+    }
     // Start detection
     det_source->Start();
     // Link video source to detection source
-    video_source->AddVideoSink(det_source.get());
+    if (video_source != nullptr) {
+      video_source->AddVideoSink(det_source.get());
+    }
+    if (camera_source != nullptr) {
+      // Link camera source to detection source
+      camera_source->AddVideoSink(det_source.get());
+    }
+    
     // Link detection source to ONVIF sink
     det_source->AddVideoSink(onvif_sink.get());
   }
 
   void Stop() {
-    video_source->Stop();
-    video_source->RemoveVideoSink(det_source.get());
+    if (camera_source != nullptr) {
+      // camera_source->Stop();
+      camera_source->RemoveVideoSink(det_source.get());
+    }
+    if (video_source != nullptr) {
+      video_source->Stop();
+      video_source->RemoveVideoSink(det_source.get());
+    }
+    
     det_source->Stop();
     det_source->RemoveVideoSink(onvif_sink.get());
 
     onvif_sink.reset();
     video_source.reset();
+    camera_source.reset();
     det_source.reset();
   }
 };
@@ -82,7 +101,9 @@ static void create_rtsp_stream(std::string_view id, std::string_view src_url,
   stream->onvif_sink = std::make_unique<rtsp::OnvifSink>(id, cfg);
 
   // create RTSP source
-  stream->video_source = std::make_unique<rtsp::RtspSource>(id, src_url);
+  // stream->video_source = std::make_unique<rtsp::RtspSource>(id, src_url);
+
+  stream->camera_source = std::make_unique<CameraSource>("camera_1", "/dev/video14");
 
   // create detection source and link to video source
   stream->det_source = std::make_unique<det::DetSource>(id);

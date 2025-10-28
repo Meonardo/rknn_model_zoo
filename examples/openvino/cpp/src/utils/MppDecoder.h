@@ -127,6 +127,7 @@ class MppDecoder {
   size_t packet_size_;
   MppFrame frame_;
   RK_S32 frame_count_;
+  RK_S32 frame_idx_;
 
   // stream data
   std::unique_ptr<RingBuffer<VideoBuffSlot*>> encoded_buffer_;
@@ -148,6 +149,7 @@ class MppDecoder {
   void Decode();
 
   bool CommitBufferGroup(RK_U32 w, RK_U32 h, size_t size);
+  void DecodeMjpeg(const void* data, size_t size, RK_U32 eos);
 };
 }  // namespace v_dec
 #endif  // GSTREAMERANDROID_MEDIACORE_SRC_MAIN_CPP_UTILS_MPPDECODER_H_

@@ -188,6 +188,16 @@ static MppBufferGroup dec_buf_mgr_setup(DecBufMgr mgr, RK_U32 size, RK_U32 count
   return impl ? impl->group : nullptr;
 }
 
+static MppBuffer get_hw_mpp_buffer(DecBufMgr mgr, int index) {
+  auto impl = (DecBufMgrImpl*) mgr;
+
+  if (!impl || !impl->bufs || index >= (int) impl->buf_count) {
+    return nullptr;
+  }
+
+  return impl->bufs[index];
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 MppDecoder::MppDecoder(MppCodingType type, RK_U32 width, RK_U32 height, void* user_data)
@@ -206,6 +216,7 @@ MppDecoder::MppDecoder(MppCodingType type, RK_U32 width, RK_U32 height, void* us
       packet_size_(DEFAULT_PACKET_SIZE),
       frame_(nullptr),
       frame_count_(0),
+      frame_idx_(0),
       buffer_pool_(nullptr),
       encoded_buffer_(nullptr),
       dec_input_thread_(nullptr),
@@ -288,10 +299,24 @@ void MppDecoder::InitDecoderData() {
     }*/
   }
 
-  if (type_ == MPP_VIDEO_CodingAVC) {
+  if (type_ == MPP_VIDEO_CodingAVC || type_ == MPP_VIDEO_CodingMJPEG) {
     // set buffer group
     auto buffer_size = MPP_ALIGN(width_, 16) * MPP_ALIGN(height_, 16) * 2;
     CommitBufferGroup(width_, height_, buffer_size);
+
+    if (type_ == MPP_VIDEO_CodingMJPEG) {
+      ret = mpp_frame_init(&frame_);
+      if (ret) {
+        LOGE(TAG, "mpp_frame_init failed");
+        return;
+      }
+      auto fmt = MPP_FMT_YUV420SP;
+      MPP_RET ret = mpi_->control(ctx_, MPP_DEC_SET_OUTPUT_FORMAT, &fmt);
+      if (ret) {
+        LOGE(TAG, "Failed to set output format 0x%x", fmt);
+        return;
+      }
+    }
   }
 
   // create decoding threads
@@ -301,16 +326,24 @@ void MppDecoder::InitDecoderData() {
     pthread_setname_np(dec_input_thread_->native_handle(), "MppDecodeInputThread");
   }
 
-  dec_output_thread_ = std::make_unique<std::thread>(&MppDecoder::Decode, this);
-  // set thread name
-  pthread_setname_np(dec_output_thread_->native_handle(), "MppDecodingThread");
+  if (type_ != MPP_VIDEO_CodingMJPEG) {
+    dec_output_thread_ = std::make_unique<std::thread>(&MppDecoder::Decode, this);
+    // set thread name
+    pthread_setname_np(dec_output_thread_->native_handle(), "MppDecodingThread");
+  }
 }
 
 bool MppDecoder::CommitBufferGroup(RK_U32 w, RK_U32 h, size_t size) {
   if (w == 0 || h == 0) {
     return false;  // no resolution info, this will be called in decode thread
   }
-  frm_grp_ = dec_buf_mgr_setup(buf_mgr_, size, kMaxDecodedFrameBufferCount, buf_mode_);
+
+  RK_U32 count = kMaxDecodedFrameBufferCount;
+  if (type_ == MPP_VIDEO_CodingMJPEG) {
+    count = kMaxDecodedFrameBufferCount + 1;
+  }
+
+  frm_grp_ = dec_buf_mgr_setup(buf_mgr_, size, count, buf_mode_);
   /* Set buffer to mpp decoder */
   auto ret = mpi_->control(ctx_, MPP_DEC_SET_EXT_BUF_GROUP, frm_grp_);
   if (ret != 0) {
@@ -546,6 +579,10 @@ void MppDecoder::DecodeNow(const void* data, size_t size, RK_U32 eos) {
     LOGW(TAG, "found eos in packet");
     mpp_packet_set_eos(packet_);
   }
+  if (type_ == MPP_VIDEO_CodingMJPEG) {
+    DecodeMjpeg(data, size, eos);
+    return;
+  }
 
   mpp_packet_set_data(packet_, (char*) data);
   mpp_packet_set_size(packet_, size);
@@ -563,6 +600,71 @@ void MppDecoder::DecodeNow(const void* data, size_t size, RK_U32 eos) {
     // if failed wait a moment and retry
     msleep(1);
   } while (!loop_end_.load());
+}
+
+void MppDecoder::DecodeMjpeg(const void* data, size_t size, RK_U32 eos) {
+  MPP_RET ret = MPP_OK;
+  // Get output buffer for decoded frame
+  MppBuffer output_buffer = get_hw_mpp_buffer(buf_mgr_, frame_idx_);
+  if (output_buffer == nullptr) {
+    LOGE(TAG, "get_hw_mpp_buffer failed");
+    return;
+  }
+  // RingBuffer style frame index
+  frame_idx_ = (frame_idx_ + 1) % kMaxDecodedFrameBufferCount;
+  // set buffer to receive decoded frame
+  mpp_frame_set_buffer(frame_, output_buffer);
+
+  // Get input buffer for encoded data
+  MppBuffer input_buffer = get_hw_mpp_buffer(buf_mgr_, kMaxDecodedFrameBufferCount);
+  auto ptr = mpp_buffer_get_ptr(input_buffer);
+  if (ptr == nullptr) {
+    LOGE(TAG, "mpp_buffer_get_ptr failed");
+    return;
+  }
+  // Copy data to buffer
+  std::memcpy(ptr, data, size);
+
+  // Init the encoded packet
+  MppPacket packet = nullptr;
+  ret = mpp_packet_init_with_buffer(&packet, input_buffer);
+  if (ret != MPP_OK) {
+    LOGE(TAG, "mpp_packet_init failed");
+    return;
+  }
+  auto meta = mpp_packet_get_meta(packet);
+  if (meta) {
+    mpp_meta_set_frame(meta, KEY_OUTPUT_FRAME, frame_);
+  }
+
+  // Put packet to decoder
+  ret = mpi_->decode_put_packet(ctx_, packet);
+  if (MPP_OK != ret) {
+    LOGE(TAG, "decode_put_packet failed ret %d", ret);
+    return;
+  }
+
+  // Get decoded frame
+  ret = mpi_->decode_get_frame(ctx_, &frame_);
+  if (ret) {
+    LOGE(TAG, "decode_get_frame failed ret %d", ret);
+    return;
+  }
+
+  // save or callback the frame
+  if (callback_) {
+    int dma_fd = mpp_buffer_get_fd(mpp_frame_get_buffer(frame_));
+    callback_(user_data_, mpp_frame_get_hor_stride(frame_), mpp_frame_get_ver_stride(frame_),
+              mpp_frame_get_width(frame_), mpp_frame_get_height(frame_), mpp_frame_get_fmt(frame_),
+              dma_fd);
+  }
+
+  meta = mpp_frame_get_meta(frame_);
+  if (meta) {
+    mpp_meta_get_packet(meta, KEY_INPUT_PACKET, &packet);
+  }
+
+  mpp_packet_deinit(&packet);
 }
 
 }  // namespace v_dec

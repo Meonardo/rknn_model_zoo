@@ -966,8 +966,9 @@ void DetSource::MainLoop() {
     // Post-process
     auto detected_objects = PostProcess();
     for (const auto& obj : detected_objects) {
-      LOGI(TAG, "Detected: %s, score=%.3f, box=[%d, %d, %d, %d]", kClassNames[obj.label], obj.score,
-           obj.box.x, obj.box.y, obj.box.width, obj.box.height);
+      LOGI(TAG, "Detected: [%d]%s, score=%.3f, box=[%d, %d, %d, %d]",
+           obj.label, kClassNames[obj.label], obj.score, obj.box.x, obj.box.y, obj.box.width,
+           obj.box.height);
     }
 
     // Draw OSD

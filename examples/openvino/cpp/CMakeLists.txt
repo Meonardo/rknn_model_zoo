@@ -36,7 +36,7 @@ set(ANDROID_APK OFF)
 
 set(RGA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/librga")
 set(RKNN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/rknpu2")
-set(MPP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/mpp")
+set(MPP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/mpp_new")
 set(OSAL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/osal")
 set(CV_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/opencv-4.10.0")
 
@@ -48,6 +48,7 @@ set(SRC_FILES
         src/OnvifCore.cpp
         src/OnvifSink.cpp
         src/RtspSource.cpp
+        src/CameraSource.cpp
 
         src/utils/DmaAlloc.cpp
         src/utils/MppDecoder.cpp
