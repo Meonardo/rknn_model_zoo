@@ -26,6 +26,9 @@
 #define CMA_HEAP_UNCACHED_PATH          "/dev/dma_heap/cma-uncached"
 #define RV1106_CMA_HEAP_PATH            "/dev/rk_dma_heap/rk-dma-heap-cma"
 
+#include <string.h>
+#include <stdint.h>
+
 int dma_sync_device_to_cpu(int fd);
 int dma_sync_cpu_to_device(int fd);
 

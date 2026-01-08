@@ -61,4 +61,16 @@ examples/openvino/cpp/src/onvif
 examples/openvino/cpp/build
 examples/openvino/cpp/install
 
+examples/cpp_common/deps
+
+examples/insightface/cpp/build
+examples/insightface/cpp/install
+examples/insightface/model
+examples/insightface/python/__pycache__/
+examples/insightface/python/*.onnx
+examples/insightface/python/*.png
+examples/insightface/python/*.jpeg
+examples/insightface/python/*.jpg
+
+
 datasets/COCO/sign

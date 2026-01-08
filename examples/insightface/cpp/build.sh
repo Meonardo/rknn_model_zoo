@@ -22,15 +22,6 @@ if [ -z "$MODE" ]; then
 fi
 echo "Build mode: $MODE"
 
-# get action type from command line input
-# action are: action detection, hand-sign recognition
-DET_TYPE=$3
-if [ -z "$DET_TYPE" ]; then
-    echo "No detection type specified, use default action detection"
-    DET_TYPE="SIGN"
-fi
-echo "Detection type: $DET_TYPE"
-
 SCRIPT_DIR=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 echo "Current dir: $SCRIPT_DIR"
 
@@ -51,7 +42,7 @@ ANDROID_PLATFORM=android-29
 STRIP=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
 
 # Run CMake
-cmake -B $SCRIPT_DIR/build -DCMAKE_TOOLCHAIN_FILE=$TOOLCHAIN -DANDROID_ABI=$ANDROID_ABI -DANDROID_PLATFORM=$ANDROID_PLATFORM -DCMAKE_BUILD_TYPE=$MODE -DDET_TYPE=$DET_TYPE
+cmake -B $SCRIPT_DIR/build -DCMAKE_TOOLCHAIN_FILE=$TOOLCHAIN -DANDROID_ABI=$ANDROID_ABI -DANDROID_PLATFORM=$ANDROID_PLATFORM -DCMAKE_BUILD_TYPE=$MODE
 
 # Build the project
 cd $SCRIPT_DIR/build
@@ -59,11 +50,11 @@ make -j$(nproc)
 
 if [ "$MODE" == "Release" ]; then
   # Strip the binary
-  $STRIP --strip-unneeded detection
+  $STRIP --strip-unneeded insightface
 fi
 
 # Copy the binary to the install directory
-cp detection $INSTALL_DIR/bin
+cp insightface $INSTALL_DIR/bin
 # Copy deps lib to the install directory
 cp ../../../../3rdparty/rknpu2/Android/arm64-v8a/librknnrt.so $INSTALL_DIR/lib
 cp ../deps/mpp_new/lib/librockchip_mpp.so $INSTALL_DIR/lib

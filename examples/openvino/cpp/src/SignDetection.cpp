@@ -101,9 +101,9 @@ static void create_rtsp_stream(std::string_view id, std::string_view src_url,
   stream->onvif_sink = std::make_unique<rtsp::OnvifSink>(id, cfg);
 
   // create RTSP source
-  // stream->video_source = std::make_unique<rtsp::RtspSource>(id, src_url);
+  stream->video_source = std::make_unique<rtsp::RtspSource>(id, src_url);
 
-  stream->camera_source = std::make_unique<CameraSource>("camera_1", "/dev/video14");
+  // stream->camera_source = std::make_unique<CameraSource>("camera_1", "/dev/video14");
 
   // create detection source and link to video source
   stream->det_source = std::make_unique<det::DetSource>(id);

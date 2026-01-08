@@ -17,7 +17,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Since this is the top level CMakeLists.txt, the project name is also accessible
 # with ${CMAKE_PROJECT_NAME} (both CMake variables are in-sync within the top level
 # build script scope).
-project("detection")
+project("insightface")
 set(ANDROID_APK OFF)
 
 # Creates and names a library, sets it as either STATIC
@@ -42,9 +42,12 @@ set(MPP_ROOT "${PUBLIC_FILE_ROOT}/deps/mpp_new")
 set(OSAL_ROOT "${PUBLIC_FILE_ROOT}/deps/osal")
 set(CV_ROOT "${PUBLIC_FILE_ROOT}/deps/opencv-4.10.0")
 set(ONVIF_ROOT "${PUBLIC_FILE_ROOT}/deps/onvif")
+set(SQLITE3_ROOT "${PUBLIC_FILE_ROOT}/deps/SQLiteCpp")
 
 # onvif
 add_subdirectory(${ONVIF_ROOT} ${CMAKE_BINARY_DIR}/onvif_build)
+# sqlites for cpp
+add_subdirectory(${SQLITE3_ROOT} ${CMAKE_BINARY_DIR}/sqlite3_build)
 
 set(SRC_FILES
 
@@ -57,6 +60,10 @@ set(SRC_FILES
         ${PUBLIC_FILE_ROOT}/utils/MppDecoder.cpp
         ${PUBLIC_FILE_ROOT}/utils/MppEncoder.cpp
         ${PUBLIC_FILE_ROOT}/utils/RgaBufferPool.cpp
+        ${PUBLIC_FILE_ROOT}/utils/Utils.cpp
+
+        src/FaceDetector.cpp
+        src/FaceExtractor.cpp
 )
 
 if (ANDROID_APK)
@@ -72,16 +79,13 @@ if (ANDROID_APK)
             ANDROID_APK
     )
 else ()
-    if (DET_TYPE STREQUAL "ACTION")
-        list(APPEND SRC_FILES src/ActionDetection.cpp)
-    else ()
-        list(
-                APPEND 
-                SRC_FILES 
-                src/SignDetection.cpp
-                src/DetSource.cpp
-        )
-    endif ()
+    list(
+        APPEND 
+        SRC_FILES 
+
+        src/main.cpp
+        src/DetSource.cpp
+    )
 
     add_executable(
             ${CMAKE_PROJECT_NAME}
@@ -122,6 +126,9 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
 
         # ONVIF
         onvif
+
+        # sqlitecpp
+        SQLiteCpp
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME}
