@@ -271,6 +271,8 @@ DetSource::DetSource(std::string_view id, const std::vector<face::FaceLocation>&
     : id_(id),
       running_(false),
       worker_thread_(nullptr),
+      thread_pool_(nullptr),
+      extractors_pool_(nullptr),
       detector_(nullptr),
       last_success_fd_(-1),
       ready_(false),
@@ -293,6 +295,10 @@ int DetSource::Init() {
   detector_ =
       std::make_unique<face::FaceDetector>(DET_MODEL_PATH, kDetScoreThreshold, kDetNmsThreshold);
 #if PARALLEL_EXECUTION
+  thread_pool_ =
+      std::make_unique<ThreadPool>(/*num_threads=*/MAX_PARALLEL_TASKS, /*max_queue_size=*/64);
+  extractors_pool_ = std::make_unique<ContextPool>(MAX_PARALLEL_TASKS);
+  // Create extractors
   auto main_extractor = new face::FaceExtractorP(EXT_MODEL_PATH, frame_width_, frame_height_);
   extractors_.push_back(main_extractor);
   rknn_context main_ctx = main_extractor->GetRknnContext();
@@ -585,7 +591,7 @@ void DetSource::MainLoop() {
       }
 
       // Draw OSD
-      DrawOsd(rgb_buffer, detected_faces);
+      // DrawOsd(rgb_buffer, detected_faces);
     }
 
     // Convert back to NV12
@@ -758,38 +764,29 @@ int DetSource::ExtractEmbeddings(rga_buffer_t* src, std::vector<face::FaceLocati
     return ExtractOne(extractors_[0], src, crop_buffers_[0], faces[0]);
   }
 
-  // Group faces into batches
-  const int batch_size = MAX_PARALLEL_TASKS;
-  int num_batches = (num_faces + batch_size - 1) / batch_size;
-  for (int batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
-    int start_idx = batch_idx * batch_size;
-    int end_idx = std::min(start_idx + batch_size, num_faces);
-    int current_batch_size = end_idx - start_idx;
+  // Multiple faces, parallel execution
+  std::latch latch(static_cast<std::ptrdiff_t>(faces.size()));
+  for (int i = 0; i < num_faces; ++i) {
+    thread_pool_->Post([&, i]() {
+      auto& face = faces[i];
+      auto& box = face.box;
+      
+      auto pool_id = extractors_pool_->Acquire();
+      auto* crop_buffer = crop_buffers_[pool_id];
+      auto* extractor = extractors_[pool_id];
 
-    std::latch latch(current_batch_size);
+      // Extract one face
+      int ret = ExtractOne(extractor, src, crop_buffer, face);
+      if (ret != 0) {
+        LOGE(TAG, "ExtractOne failed for face idx %d, ret=%d", i, ret);
+      }
 
-    for (int i = 0; i < current_batch_size; ++i) {
-      int face_idx = start_idx + i;
-      // Launch parallel task
-      std::thread([this, src, &faces, face_idx, &latch]() {
-        auto& face = faces[face_idx];
-        auto& box = face.box;
-        auto* crop_buffer = crop_buffers_[face_idx % MAX_PARALLEL_TASKS];
-        auto* extractor = extractors_[face_idx % MAX_PARALLEL_TASKS];
-
-        // Extract one face
-        int ret = ExtractOne(extractor, src, crop_buffer, face);
-        if (ret != 0) {
-          LOGE(TAG, "ExtractOne failed for face idx %d, ret=%d", face_idx, ret);
-        }
-
-        latch.count_down();
-      }).detach();
-    }
-
-    // Wait for all tasks in the batch to complete
-    latch.wait();
+      extractors_pool_->Release(pool_id);
+      latch.count_down();
+    });
   }
+  latch.wait();
+
   return 0;
 }
 

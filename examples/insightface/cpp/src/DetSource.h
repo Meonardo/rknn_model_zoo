@@ -19,9 +19,11 @@
 #include "RingBuffer.h"
 #include "VideoCommon.h"
 
+#include "ThreadPool.h"
+
 #define PARALLEL_EXECUTION 1
 
-#define MAX_PARALLEL_TASKS 4
+#define MAX_PARALLEL_TASKS 8
 
 namespace det {
 
@@ -90,6 +92,8 @@ class DetSource : public RawVideoSink, public VideoSource {
   std::string id_;
   std::atomic<bool> running_;
   std::unique_ptr<std::thread> worker_thread_;
+  std::unique_ptr<ThreadPool> thread_pool_;
+  std::unique_ptr<ContextPool> extractors_pool_;
 
   // Detector & Extractor
   std::unique_ptr<face::FaceDetector> detector_;
