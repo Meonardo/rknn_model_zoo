@@ -397,4 +397,71 @@ cv::Point2f landmark_to_patch_112(const cv::Point2f& p_img,
   return cv::Point2f((p_img.x - crop.x) * sx, (p_img.y - crop.y) * sy);
 }
 
+float dot_product_neon_512(const float* a, const float* b) {
+  constexpr size_t kN = 512;
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+  float32x4_t acc = vdupq_n_f32(0.0f);
+  for (size_t i = 0; i < kN; i += 4) {
+    float32x4_t va = vld1q_f32(a + i);
+    float32x4_t vb = vld1q_f32(b + i);
+#if defined(__aarch64__)
+    acc = vfmaq_f32(acc, va, vb);
+#else
+    acc = vmlaq_f32(acc, va, vb);
+#endif
+  }
+
+#if defined(__aarch64__)
+  return vaddvq_f32(acc);
+#else
+  float32x2_t s2 = vadd_f32(vget_low_f32(acc), vget_high_f32(acc));
+  s2 = vpadd_f32(s2, s2);
+  return vget_lane_f32(s2, 0);
+#endif
+#else
+  float sum = 0.0f;
+  for (size_t i = 0; i < kN; ++i) sum += a[i] * b[i];
+  return sum;
+#endif
+}
+
+void l2_normalize_neon_512(float* v, float eps) {
+  constexpr size_t kN = 512;
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+  float32x4_t acc = vdupq_n_f32(0.0f);
+  for (size_t i = 0; i < kN; i += 4) {
+    float32x4_t x = vld1q_f32(v + i);
+#if defined(__aarch64__)
+    acc = vfmaq_f32(acc, x, x);
+#else
+    acc = vmlaq_f32(acc, x, x);
+#endif
+  }
+
+#if defined(__aarch64__)
+  float sumsq = vaddvq_f32(acc);
+#else
+  float32x2_t s2 = vadd_f32(vget_low_f32(acc), vget_high_f32(acc));
+  s2 = vpadd_f32(s2, s2);
+  float sumsq = vget_lane_f32(s2, 0);
+#endif
+
+  const float inv_norm = 1.0f / std::sqrt(sumsq + eps);
+  const float32x4_t k = vdupq_n_f32(inv_norm);
+
+  for (size_t i = 0; i < kN; i += 4) {
+    float32x4_t x = vld1q_f32(v + i);
+    x = vmulq_f32(x, k);
+    vst1q_f32(v + i, x);
+  }
+#else
+  float sumsq = 0.0f;
+  for (size_t i = 0; i < kN; ++i) sumsq += v[i] * v[i];
+  const float inv_norm = 1.0f / std::sqrt(sumsq + eps);
+  for (size_t i = 0; i < kN; ++i) v[i] *= inv_norm;
+#endif
+}
+
 }  // namespace face

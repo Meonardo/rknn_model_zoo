@@ -537,6 +537,7 @@ void FaceDetector::DecodeOutputV2(const int8_t* scores_raw, const int8_t* boxes_
 
       face_info.box = UnScale(x1, y1, x2, y2);
       face_info.score = score_prob;
+      face_info.embedding = {0.f};
 
       for (int j = 0; j < 5; ++j) {
         float pxx = ((float) lmk_ch_base[(j * 2 + 0) * loc_count + s] - (float) lmk_zp) * lmk_scale;

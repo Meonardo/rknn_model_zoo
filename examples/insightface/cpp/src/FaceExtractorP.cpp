@@ -327,6 +327,8 @@ int FaceExtractorP::Extract(rga_buffer_t* cropped_face, float* lmk, Embeddings& 
     embeddings[i] = e;
   }
 
+  l2_normalize_neon_512(embeddings.data());
+
   return 0;
 }
 
@@ -336,7 +338,7 @@ rga_buffer_t* FaceExtractorP::Affine(rga_buffer_t* cropped_face, cv::Mat& src, f
     return nullptr;
   }
 
-  auto begin = std::chrono::high_resolution_clock::now();
+  // auto begin = std::chrono::high_resolution_clock::now();
 
   cv::Mat affine_mat(model_input_height_, model_input_width_, CV_8UC3, cropped_face->vir_addr,
                      model_input_width_ * 3);
@@ -345,9 +347,9 @@ rga_buffer_t* FaceExtractorP::Affine(rga_buffer_t* cropped_face, cv::Mat& src, f
 #if 0
   cv::imwrite(TEST_CROP_IMAGE_PATH, affine_mat);
 #endif
-  auto end = std::chrono::high_resolution_clock::now();
-  LOGD(TAG, "Affine time: %lld ms",
-       std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count());
+  // auto end = std::chrono::high_resolution_clock::now();
+  // LOGD(TAG, "Affine time: %lld ms",
+  //      std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count());
 
   // Copy src to `src_image_rga_buffer_`
   im_rect dst_rect = {0, 0, (int) model_input_width_, (int) model_input_height_};

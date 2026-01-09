@@ -485,6 +485,8 @@ int FaceExtractor::Extract(rga_buffer_t* input_buffer, std::vector<FaceLocation>
                                                 deqnt_params_.zero_point);
       face.embedding[i] = e;
     }
+
+    l2_normalize_neon_512(face.embedding.data());
 #else
     // Directly read float32 output
     float* output_data = (float*) output_mems_[0]->virt_addr;
@@ -582,6 +584,8 @@ int FaceExtractor::ExtractFromFullSize(rga_buffer_t* input_buffer,
                                                 deqnt_params_.zero_point);
       face.embedding[i] = e;
     }
+
+    l2_normalize_neon_512(face.embedding.data());
 #else
     // Directly read float32 output
     float* output_data = (float*) output_mems_[0]->virt_addr;

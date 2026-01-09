@@ -2,6 +2,13 @@
 #define UTILS_H_
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cmath>
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+  #include <arm_neon.h>
+#endif
 
 // OpenCV
 #include <opencv2/core.hpp>
@@ -41,6 +48,10 @@ cv::Rect2f make_square_crop(float x, float y, float w, float h, float img_w,
 cv::Point2f landmark_to_patch_112(const cv::Point2f& p_img,
                                   const cv::Rect2f& crop /* in img space */,
                                   float out_size /*112*/);
+
+float dot_product_neon_512(const float* a, const float* b);
+
+void l2_normalize_neon_512(float* v, float eps = 1e-12f);
 
 }  // namespace face
 

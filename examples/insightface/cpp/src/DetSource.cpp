@@ -573,7 +573,9 @@ void DetSource::MainLoop() {
         std::string matched_name = "";
         int face_id = -1;
         for (const auto& reg_face : registered_faces_) {
-          float sim = compare_faces(det_face.embedding, reg_face.embedding);
+          float sim =
+              face::dot_product_neon_512(det_face.embedding.data(), reg_face.embedding.data());
+          // float sim = compare_faces(det_face.embedding, reg_face.embedding);
           if (sim > max_sim) {
             max_sim = sim;
             matched_name = reg_face.name;
@@ -591,7 +593,7 @@ void DetSource::MainLoop() {
       }
 
       // Draw OSD
-      // DrawOsd(rgb_buffer, detected_faces);
+      DrawOsd(rgb_buffer, detected_faces);
     }
 
     // Convert back to NV12
@@ -770,7 +772,7 @@ int DetSource::ExtractEmbeddings(rga_buffer_t* src, std::vector<face::FaceLocati
     thread_pool_->Post([&, i]() {
       auto& face = faces[i];
       auto& box = face.box;
-      
+
       auto pool_id = extractors_pool_->Acquire();
       auto* crop_buffer = crop_buffers_[pool_id];
       auto* extractor = extractors_[pool_id];
