@@ -3,10 +3,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <latch>
 #include <limits>
 #include <numeric>
 #include <set>
-#include <tuple>
 
 #include "Common.h"
 #include "utils/Utils.h"
@@ -31,7 +31,8 @@ namespace det {
 constexpr uint32_t kOsdColor = 0xff00ff00;
 constexpr float kDetScoreThreshold = 0.5f;
 constexpr float kDetNmsThreshold = 0.4f;
-constexpr float kRecogSimilarityThreshold = 0.35f;
+constexpr float kRecogSimilarityThreshold = 0.45f;
+constexpr int kExtractorInputSize = 112;
 
 // Cosine similarity for face matching
 static float compare_faces(const face::Embeddings& emb1, const face::Embeddings& emb2) {
@@ -291,8 +292,20 @@ int DetSource::Init() {
   // Create detector
   detector_ =
       std::make_unique<face::FaceDetector>(DET_MODEL_PATH, kDetScoreThreshold, kDetNmsThreshold);
+#if PARALLEL_EXECUTION
+  auto main_extractor = new face::FaceExtractorP(EXT_MODEL_PATH, frame_width_, frame_height_);
+  extractors_.push_back(main_extractor);
+  rknn_context main_ctx = main_extractor->GetRknnContext();
+  for (int i = 1; i < MAX_PARALLEL_TASKS; ++i) {
+    auto extractor = new face::FaceExtractorP(&main_ctx, frame_width_, frame_height_);
+    extractors_.push_back(extractor);
+  }
+  CreateCropBuffers();
+#else
   // Create extractor
-  extractor_ = std::make_unique<face::FaceExtractor>(EXT_MODEL_PATH, frame_width_, frame_height_);
+  extractor_ =
+      std::make_unique<face::FaceExtractor>(EXT_MODEL_PATH, false, frame_width_, frame_height_);
+#endif  // PARALLEL_EXECUTION
   // Create ring buffer
   ring_buffer_ = std::make_unique<RingBuffer<VideoFrameSlot>>(kDefaultRingBufferSize);
   // Create rga buffers
@@ -313,9 +326,21 @@ void DetSource::DeInit() {
   // Destroy OSD texts
   DestroyOsdTexts();
 
-  // Release detector & extractor
+  // Release detector
   detector_.reset();
+
+#if PARALLEL_EXECUTION
+  // Release extractors
+  for (auto& extractor : extractors_) {
+    delete extractor;
+  }
+  extractors_.clear();
+  crop_buffers_.clear();
+  DestroyCropBuffers();
+#else
+  // Release extractor
   extractor_.reset();
+#endif  // PARALLEL_EXECUTION
 
   LOGI(TAG, "DetSource deinitialized successfully");
 }
@@ -528,8 +553,13 @@ void DetSource::MainLoop() {
     auto detected_faces = detector_->Detect(rgb_buffer);
 
     if (!detected_faces.empty()) {
+#if PARALLEL_EXECUTION
+      // Parallel crop & extract
+      ExtractEmbeddings(rgb_buffer, detected_faces);
+#else
       // Extract embeddings
       extractor_->Extract(rgb_buffer, detected_faces);
+#endif  // PARALLEL_EXECUTION
 
       // Check similarity with registered faces
       for (auto& det_face : detected_faces) {
@@ -550,6 +580,7 @@ void DetSource::MainLoop() {
           det_face.id = face_id;  // To match the OSD text index(NOTICE: osd_idx = face_id - 1)
         } else {
           det_face.id = -1;
+          LOGW(TAG, "No matched face found for detected face, max similarity: %.4f", max_sim);
         }
       }
 
@@ -680,5 +711,122 @@ void DetSource::DrawOsd(rga_buffer_t* buffer, const std::vector<face::FaceLocati
     imcancelJob(job);
   }
 }
+
+#if PARALLEL_EXECUTION
+
+void DetSource::CreateCropBuffers() {
+  for (int i = 0; i < MAX_PARALLEL_TASKS; ++i) {
+    // Allocate buffer for cropped image
+    auto buf_size = kExtractorInputSize * kExtractorInputSize * 3;
+    auto vir_addr = (char*) calloc(buf_size, sizeof(char));
+    if (vir_addr == nullptr) {
+      assert(false && "FaceExtractor alloc system buffer failed");
+    }
+    // Import to RGA buffer
+    auto handle = importbuffer_virtualaddr(vir_addr, buf_size);
+    if (handle == 0) {
+      assert(false && "FaceExtractor importbuffer_virtualaddr failed");
+    }
+    rga_buffer_t* buffer = new rga_buffer_t;
+    *buffer =
+        wrapbuffer_handle(handle, kExtractorInputSize, kExtractorInputSize, RK_FORMAT_RGB_888);
+    buffer->vir_addr = vir_addr;
+    crop_buffers_.push_back(buffer);
+  }
+}
+
+void DetSource::DestroyCropBuffers() {
+  for (auto& buffer : crop_buffers_) {
+    if (buffer->handle > 0) {
+      releasebuffer_handle(buffer->handle);
+      buffer->handle = 0;
+    }
+    if (buffer->vir_addr) {
+      auto buf_size = kExtractorInputSize * kExtractorInputSize * 3;
+      dma_buf_free(buf_size, nullptr, buffer->vir_addr);
+      buffer->vir_addr = nullptr;
+    }
+    delete buffer;
+  }
+  crop_buffers_.clear();
+}
+
+int DetSource::ExtractEmbeddings(rga_buffer_t* src, std::vector<face::FaceLocation>& faces) {
+  int num_faces = (int) faces.size();
+  if (num_faces == 1) {
+    // Single face, no need for parallel
+    return ExtractOne(extractors_[0], src, crop_buffers_[0], faces[0]);
+  }
+
+  // Group faces into batches
+  const int batch_size = MAX_PARALLEL_TASKS;
+  int num_batches = (num_faces + batch_size - 1) / batch_size;
+  for (int batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
+    int start_idx = batch_idx * batch_size;
+    int end_idx = std::min(start_idx + batch_size, num_faces);
+    int current_batch_size = end_idx - start_idx;
+
+    std::latch latch(current_batch_size);
+
+    for (int i = 0; i < current_batch_size; ++i) {
+      int face_idx = start_idx + i;
+      // Launch parallel task
+      std::thread([this, src, &faces, face_idx, &latch]() {
+        auto& face = faces[face_idx];
+        auto& box = face.box;
+        auto* crop_buffer = crop_buffers_[face_idx % MAX_PARALLEL_TASKS];
+        auto* extractor = extractors_[face_idx % MAX_PARALLEL_TASKS];
+
+        // Extract one face
+        int ret = ExtractOne(extractor, src, crop_buffer, face);
+        if (ret != 0) {
+          LOGE(TAG, "ExtractOne failed for face idx %d, ret=%d", face_idx, ret);
+        }
+
+        latch.count_down();
+      }).detach();
+    }
+
+    // Wait for all tasks in the batch to complete
+    latch.wait();
+  }
+  return 0;
+}
+
+int DetSource::ExtractOne(face::FaceExtractorP* extractor, rga_buffer_t* src, rga_buffer_t* dst,
+                          face::FaceLocation& face) {
+  auto& box = face.box;
+  auto crop_rect = face::make_square_crop(box.x, box.y, box.width, box.height, (float) src->width,
+                                          (float) src->height, 1.2f);
+  // Convert lmk points to cropped patch space
+  float lmk[10] = {0.f};
+  for (int i = 0; i < 5; ++i) {
+    cv::Point2f p_img(face.lmk[i * 2], face.lmk[i * 2 + 1]);
+    cv::Point2f p_patch =
+        face::landmark_to_patch_112(p_img, crop_rect, (float) kExtractorInputSize);
+    lmk[i * 2] = p_patch.x;
+    lmk[i * 2 + 1] = p_patch.y;
+  }
+
+  // Crop face using RGA
+  im_rect src_rect = {(int) crop_rect.x, (int) crop_rect.y, (int) crop_rect.width,
+                      (int) crop_rect.height};
+  im_rect dst_rect = {0, 0, kExtractorInputSize, kExtractorInputSize};
+  auto ret = imcheck(*src, *dst, src_rect, dst_rect);
+  if (IM_STATUS_NOERROR != ret) {
+    LOGE(TAG, "crop imcheck failed: %s", imStrError((IM_STATUS) ret));
+    return -1;
+  }
+  ret = improcess(*src, *dst, {}, src_rect, dst_rect, {}, IM_SYNC);
+  if (ret != IM_STATUS_SUCCESS) {
+    LOGE(TAG, "crop improcess failed: %s", imStrError((IM_STATUS) ret));
+    return -2;
+  }
+
+  // Extract embedding
+  return extractor->Extract(dst, lmk, face.embedding);
+}
+
+#endif  // PARALLEL_EXECUTION
 
 }  // namespace det

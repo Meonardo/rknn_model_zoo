@@ -11,7 +11,8 @@ namespace face {
 
 class FaceExtractor {
  public:
-  explicit FaceExtractor(const std::string& model_path, int frame_width, int frame_height);
+  explicit FaceExtractor(const std::string& model_path, bool full_size_crop, int frame_width,
+                         int frame_height);
   ~FaceExtractor();
 
   int Extract(rga_buffer_t* input_buffer, std::vector<FaceLocation>& faces);
@@ -34,8 +35,6 @@ class FaceExtractor {
   rga_buffer_t src_image_rga_buffer_;  // frame_widthxframe_height full size source image
 
   rga_buffer_t crop_image_rga_buffer_;    // 112x112 cropped face from the source image
-  rga_buffer_t affine_image_rga_buffer_;  // 112x112 after affine transform
-
   rga_buffer_t input_tensor_rga_buffer_;
 
   uint32_t model_input_width_;

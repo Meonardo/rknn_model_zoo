@@ -14,9 +14,14 @@
 
 #include "FaceDetector.h"
 #include "FaceExtractor.h"
+#include "FaceExtractorP.h"
 #include "RgaBufferPool.h"
 #include "RingBuffer.h"
 #include "VideoCommon.h"
+
+#define PARALLEL_EXECUTION 1
+
+#define MAX_PARALLEL_TASKS 4
 
 namespace det {
 
@@ -88,7 +93,12 @@ class DetSource : public RawVideoSink, public VideoSource {
 
   // Detector & Extractor
   std::unique_ptr<face::FaceDetector> detector_;
+#if PARALLEL_EXECUTION
+  std::vector<rga_buffer_t*> crop_buffers_;
+  std::vector<face::FaceExtractorP*> extractors_;
+#else
   std::unique_ptr<face::FaceExtractor> extractor_;
+#endif  // PARALLEL_EXECUTION
 
   // RGA buffers
   std::unique_ptr<RingBuffer<VideoFrameSlot>> ring_buffer_;
@@ -129,6 +139,14 @@ class DetSource : public RawVideoSink, public VideoSource {
   void DestroyOsdTexts();
 
   void DrawOsd(rga_buffer_t* buffer, const std::vector<face::FaceLocation>& objects);
+
+#if PARALLEL_EXECUTION
+  void CreateCropBuffers();
+  void DestroyCropBuffers();
+  int ExtractEmbeddings(rga_buffer_t* src, std::vector<face::FaceLocation>& faces);
+  int ExtractOne(face::FaceExtractorP* extractor, rga_buffer_t* src, rga_buffer_t* dst,
+                 face::FaceLocation& face);
+#endif  // PARALLEL_EXECUTION
 };
 }  // namespace det
 

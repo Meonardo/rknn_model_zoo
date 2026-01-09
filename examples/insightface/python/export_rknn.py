@@ -4,7 +4,7 @@ from rknn.api import RKNN
 
 
 DATASET_PATH = "../model/dataset/dataset.txt"
-TARGET_PLATFORM = "rk3588"
+TARGET_PLATFORM = "rk3568"
 
 def check_model_input_size(onnx_model_path):
     model = onnx.load(onnx_model_path)

@@ -32,13 +32,24 @@ struct QntParam {
   int32_t zero_point;
   float scale;
 };
+
+cv::Mat affine_crop(cv::Mat& img, float kps[10], int size, cv::Mat& dst_mat);
+
+cv::Rect2f make_square_crop(float x, float y, float w, float h, float img_w,
+                            float img_h, float scale /* 1.2f */);
+
+cv::Point2f landmark_to_patch_112(const cv::Point2f& p_img,
+                                  const cv::Rect2f& crop /* in img space */,
+                                  float out_size /*112*/);
+
 }  // namespace face
 
 namespace util {
 
 namespace rga {
 
-int create_rga_buffer(uint32_t w, uint32_t h, RgaSURF_FORMAT fmt, rga_buffer_t& out_buffer);
+int create_rga_buffer(uint32_t w, uint32_t h, RgaSURF_FORMAT fmt,
+                      rga_buffer_t& out_buffer);
 void release_rga_buffer(rga_buffer_t& buffer);
 
 }  // namespace rga
@@ -57,12 +68,14 @@ float deqnt_affine_to_f32(int8_t qnt, int32_t zp, float scale);
 
 void compute_dfl(float* tensor, int dfl_len, float* box);
 
-void rgb24_to_nhwc_float_stride(const uint8_t* src, int W, int H, int stride, float* dst,
-                                float scale);
-void rgba32_to_nhwc_float_stride(const uint8_t* src, int W, int H, int stride, float* dst,
-                                 float scale);
-void rgba32_to_nhwc_i8_stride(const uint8_t* src, int W, int H, int stride, int8_t* dst);
-void rgb24_to_nhwc_float(const uint8_t* src, int W, int H, float* dst, float scale);
+void rgb24_to_nhwc_float_stride(const uint8_t* src, int W, int H, int stride,
+                                float* dst, float scale);
+void rgba32_to_nhwc_float_stride(const uint8_t* src, int W, int H, int stride,
+                                 float* dst, float scale);
+void rgba32_to_nhwc_i8_stride(const uint8_t* src, int W, int H, int stride,
+                              int8_t* dst);
+void rgb24_to_nhwc_float(const uint8_t* src, int W, int H, float* dst,
+                         float scale);
 
 }  // namespace rknn
 

@@ -57,7 +57,7 @@ fi
 cp insightface $INSTALL_DIR/bin
 # Copy deps lib to the install directory
 cp ../../../../3rdparty/rknpu2/Android/arm64-v8a/librknnrt.so $INSTALL_DIR/lib
-cp ../deps/mpp_new/lib/librockchip_mpp.so $INSTALL_DIR/lib
-cp ../deps/mpp_new/lib/librockchip_vpu.so $INSTALL_DIR/lib
+cp ../../../cpp_common/deps/mpp_new/lib/librockchip_mpp.so $INSTALL_DIR/lib
+cp ../../../cpp_common/deps/mpp_new/lib/librockchip_vpu.so $INSTALL_DIR/lib
 
 echo "All done!"

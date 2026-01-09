@@ -17,161 +17,13 @@ static int64_t infer_npu_time = 0;
 
 namespace face {
 
-// similarity transform destination points
-static const std::vector<cv::Point2f> SIMILARITY_TRANSFORM_DEST = {{38.2946, 51.6963},
-                                                                   {73.5318, 51.5014},
-                                                                   {56.0252, 71.7366},
-                                                                   {41.5493, 92.3655},
-                                                                   {70.7299, 92.2041}};
-
-static cv::Mat compute_similarity2d(const std::vector<cv::Point2f>& src,
-                                    const std::vector<cv::Point2f>& dst) {
-  CV_Assert(src.size() == dst.size());
-  CV_Assert(src.size() >= 2);
-
-  const int n = static_cast<int>(src.size());
-
-  // Compute means.
-  cv::Point2d mu_src(0.0, 0.0), mu_dst(0.0, 0.0);
-  for (int i = 0; i < n; ++i) {
-    mu_src.x += src[i].x;
-    mu_src.y += src[i].y;
-    mu_dst.x += dst[i].x;
-    mu_dst.y += dst[i].y;
-  }
-  mu_src.x /= n;
-  mu_src.y /= n;
-  mu_dst.x /= n;
-  mu_dst.y /= n;
-
-  // Compute centered coordinates and variance of src.
-  double var_src = 0.0;
-  cv::Matx<double, 2, 2> cov(0.0, 0.0, 0.0, 0.0);  // covariance src->dst
-  for (int i = 0; i < n; ++i) {
-    const double xs = src[i].x - mu_src.x;
-    const double ys = src[i].y - mu_src.y;
-    const double xd = dst[i].x - mu_dst.x;
-    const double yd = dst[i].y - mu_dst.y;
-
-    var_src += xs * xs + ys * ys;
-
-    // cov += [xd; yd] * [xs ys]
-    cov(0, 0) += xd * xs;
-    cov(0, 1) += xd * ys;
-    cov(1, 0) += yd * xs;
-    cov(1, 1) += yd * ys;
-  }
-
-  if (var_src <= 1e-12) {
-    // Degenerate: all src points identical.
-    return cv::Mat::eye(2, 3, CV_64F);
-  }
-
-  cov *= (1.0 / n);
-  var_src *= (1.0 / n);
-
-  // SVD of covariance - must use cv::Mat for output
-  cv::Mat U, Vt, S_vec;
-  cv::SVD::compute(cv::Mat(cov), S_vec, U, Vt);
-
-  // Extract singular values
-  cv::Vec<double, 2> S(S_vec.at<double>(0), S_vec.at<double>(1));
-
-  // Convert U and Vt to Matx for easier math
-  cv::Matx<double, 2, 2> U_matx(U.at<double>(0, 0), U.at<double>(0, 1), U.at<double>(1, 0),
-                                U.at<double>(1, 1));
-  cv::Matx<double, 2, 2> Vt_matx(Vt.at<double>(0, 0), Vt.at<double>(0, 1), Vt.at<double>(1, 0),
-                                 Vt.at<double>(1, 1));
-
-  // Rotation R = U * Vt (with reflection fix).
-  cv::Matx<double, 2, 2> R = U_matx * Vt_matx;
-
-  // If det(R) < 0, fix reflection by flipping the last column of U.
-  const double detR = R(0, 0) * R(1, 1) - R(0, 1) * R(1, 0);
-  if (detR < 0.0) {
-    U_matx(0, 1) *= -1.0;
-    U_matx(1, 1) *= -1.0;
-    R = U_matx * Vt_matx;
-    S[1] *= -1.0;  // keep trace consistent
-  }
-
-  // Scale: s = trace(S) / var_src
-  const double scale = (S[0] + S[1]) / var_src;
-
-  // Translation: t = mu_dst - s * R * mu_src
-  const cv::Vec2d muS(mu_src.x, mu_src.y);
-  const cv::Vec2d muD(mu_dst.x, mu_dst.y);
-  const cv::Vec2d t = muD - scale * (R * muS);
-
-  cv::Mat M(2, 3, CV_64F);
-  M.at<double>(0, 0) = scale * R(0, 0);
-  M.at<double>(0, 1) = scale * R(0, 1);
-  M.at<double>(1, 0) = scale * R(1, 0);
-  M.at<double>(1, 1) = scale * R(1, 1);
-  M.at<double>(0, 2) = t[0];
-  M.at<double>(1, 2) = t[1];
-
-  return M;
-}
-
-static cv::Mat norm_crop(cv::Mat& img, float kps[10], int size, cv::Mat& dst_mat) {
-  std::vector<cv::Point2f> points_five;
-  for (size_t i = 0; i < 5; i++) {
-    points_five.push_back(cv::Point2f(kps[i * 2], kps[i * 2 + 1]));
-  }
-
-  std::vector<cv::Point2f> dst(SIMILARITY_TRANSFORM_DEST);
-  float ratio = float(size) / 112.0;
-  float diff_x = 0.f;
-  for (auto& d : dst) {
-    d.x = d.x * ratio;
-    d.y = d.y * ratio;
-  }
-  for (auto& d : dst) {
-    d.x = d.x + diff_x;
-  }
-
-  cv::Mat M = compute_similarity2d(points_five, dst);
-  cv::warpAffine(img, dst_mat, M, cv::Size(size, size), cv::INTER_LINEAR, cv::BORDER_CONSTANT,
-                 cv::Scalar(0, 0, 0));
-
-  return M;
-}
-
-static inline cv::Rect2f make_square_crop(float x, float y, float w, float h, float img_w,
-                                          float img_h, float scale /* 1.2f */) {
-  float cx = x + 0.5f * w;
-  float cy = y + 0.5f * h;
-  float side = std::max(w, h) * scale;
-
-  float sx = cx - 0.5f * side;
-  float sy = cy - 0.5f * side;
-
-  // Clamp to image bounds
-  if (sx < 0) sx = 0;
-  if (sy < 0) sy = 0;
-  if (sx + side > img_w) sx = img_w - side;
-  if (sy + side > img_h) sy = img_h - side;
-  if (sx < 0) sx = 0;
-  if (sy < 0) sy = 0;
-
-  return cv::Rect2f{sx, sy, side, side};
-}
-
-static inline cv::Point2f landmark_to_patch_112(const cv::Point2f& p_img,
-                                                const cv::Rect2f& crop /* in img space */,
-                                                float out_size /*112*/) {
-  float sx = out_size / crop.width;
-  float sy = out_size / crop.height;
-  return cv::Point2f((p_img.x - crop.x) * sx, (p_img.y - crop.y) * sy);
-}
-
-FaceExtractor::FaceExtractor(const std::string& model_path, int frame_width, int frame_height)
+FaceExtractor::FaceExtractor(const std::string& model_path, bool full_size_crop, int frame_width,
+                             int frame_height)
     : model_path_(model_path),
       frame_width_(frame_width),
       frame_height_(frame_height),
       initialized_(false),
-      full_size_crop_(false),
+      full_size_crop_(full_size_crop),
       rknn_ctx_(0),
       model_input_width_(112),
       model_input_height_(112) {
@@ -377,23 +229,7 @@ void FaceExtractor::CreateRgaBuffers() {
     src_image_rga_buffer_ =
         wrapbuffer_handle(handle, frame_width_, frame_height_, RK_FORMAT_RGB_888);
     src_image_rga_buffer_.vir_addr = vir_addr;
-  } else {
-    // Allocate buffer for affine image(model input size)
-    buf_size = model_input_width_ * model_input_height_ * 3;
-    vir_addr = (char*) calloc(buf_size, sizeof(char));
-    if (vir_addr == nullptr) {
-      assert(false && "FaceExtractor alloc system buffer failed");
-    }
-    // Import to RGA buffer
-    handle = importbuffer_virtualaddr(vir_addr, buf_size);
-    if (handle == 0) {
-      assert(false && "FaceExtractor importbuffer_virtualaddr failed");
-    }
-    affine_image_rga_buffer_ =
-        wrapbuffer_handle(handle, model_input_width_, model_input_height_, RK_FORMAT_RGB_888);
-    affine_image_rga_buffer_.vir_addr = vir_addr;
   }
-
   // Allocate buffer for cropped image
   buf_size = model_input_width_ * model_input_height_ * 3;
   vir_addr = (char*) calloc(buf_size, sizeof(char));
@@ -457,15 +293,6 @@ void FaceExtractor::DestroyRgaBuffers() {
       src_image_rga_buffer_.vir_addr = nullptr;
     }
   }
-  // Release the affine image RGA buffer
-  if (affine_image_rga_buffer_.handle > 0) {
-    releasebuffer_handle(affine_image_rga_buffer_.handle);
-    affine_image_rga_buffer_.handle = -1;
-    if (affine_image_rga_buffer_.vir_addr != nullptr) {
-      free(affine_image_rga_buffer_.vir_addr);
-      affine_image_rga_buffer_.vir_addr = nullptr;
-    }
-  }
   // Release the cropped image RGA buffer
   if (crop_image_rga_buffer_.vir_addr != nullptr) {
     releasebuffer_handle(crop_image_rga_buffer_.handle);
@@ -485,7 +312,7 @@ rga_buffer_t* FaceExtractor::Crop(cv::Mat& src, FaceLocation& face) {
 
   auto begin = std::chrono::high_resolution_clock::now();
   // Align and crop face
-  norm_crop(src, face.lmk, model_input_width_, cropped_mat_);
+  affine_crop(src, face.lmk, model_input_width_, cropped_mat_);
 #if 0
   cv::imwrite(TEST_CROP_IMAGE_PATH, cropped_mat_);
 #endif
@@ -540,7 +367,7 @@ rga_buffer_t* FaceExtractor::Affine(cv::Mat& src, float *lmk) {
 
   auto begin = std::chrono::high_resolution_clock::now();
   // Align and crop face
-  norm_crop(src, lmk, model_input_width_, cropped_mat_);
+  affine_crop(src, lmk, model_input_width_, cropped_mat_);
 #if 0
   cv::imwrite(TEST_CROP_IMAGE_PATH, cropped_mat_);
 #endif

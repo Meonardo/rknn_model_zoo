@@ -18,7 +18,7 @@
 #define DB_TABLE_NAME "face"
 
 #if USE_QUANTIZED_MODEL
-#define DET_MODEL_PATH "/data/local/tmp/lldb-standalone/det_500m_fixed_i8.rknn"
+#define DET_MODEL_PATH "/data/local/tmp/lldb-standalone/det_500m_pruned_i8.rknn"
 #define EXT_MODEL_PATH "/data/local/tmp/lldb-standalone/w600k_mbf_fixed_i8.rknn"
 // #define DET_MODEL_PATH "/data/local/tmp/lldb-standalone/det_2.5g_fixed_i8.rknn"
 // #define EXT_MODEL_PATH "/data/local/tmp/lldb-standalone/w600k_r50_fixed_i8.rknn"
@@ -349,7 +349,7 @@ static int register_face(App* app, const std::string& name, const std::string& i
   // Init face detector & extractor
   app->face_detector =
       std::make_unique<face::FaceDetector>(DET_MODEL_PATH, kDetScoreThreshold, kDetNmsThreshold);
-  app->face_extractor = std::make_unique<face::FaceExtractor>(EXT_MODEL_PATH, img.cols, img.rows);
+  app->face_extractor = std::make_unique<face::FaceExtractor>(EXT_MODEL_PATH, true, img.cols, img.rows);
 
   // Check if the face with the same name already exists
   for (const auto& face : app->registered_faces) {

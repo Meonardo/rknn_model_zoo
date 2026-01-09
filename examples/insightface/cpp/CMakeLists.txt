@@ -8,7 +8,7 @@ cmake_minimum_required(VERSION 3.22.1)
 set(CMAKE_CXX_FLAGS_DEBUG "-fPIC -O0 -g -Wall")
 set(CMAKE_CXX_FLAGS_RELEASE "-fPIC -O3 -Wall -s")
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -64,6 +64,7 @@ set(SRC_FILES
 
         src/FaceDetector.cpp
         src/FaceExtractor.cpp
+        src/FaceExtractorP.cpp
 )
 
 if (ANDROID_APK)
